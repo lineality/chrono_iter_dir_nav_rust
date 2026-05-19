@@ -1,4 +1,4 @@
-//! # Chrono-Iter Module — Minimal Demo
+//! # Chrono-Iter Module — Mini Demo
 //!
 //! Demonstrates the two operations that constitute the chronological
 //! lookup system:
@@ -145,6 +145,7 @@ fn main() {
         return;
     }
 
+    // === Step 3: Chrono Navigate to Index N ===
     let mut path_buffer = [0u8; MAX_FULL_PATH_LEN];
     let lookup_result = lookup_abs_file_path_at_mtime_chronological_index(
         &temp_root,
