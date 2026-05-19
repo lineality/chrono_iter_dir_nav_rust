@@ -8,7 +8,7 @@
 //   "Has the chronological ordering of files I have already processed
 //    been retroactively changed by a delayed-thread mtime insertion?"
 //
-// This is distinct from "have new files appeared?" (which update_index
+// This is distinct from "have new files appeared?" (which create_or_update_chrono_index
 // already handles). It detects the chess-game edge case where a slow
 // thread finishes writing a move-file whose mtime is earlier than moves
 // the engine has already read, silently shifting earlier positions.
@@ -31,8 +31,8 @@ mod chrono_sort_module;
 
 use chrono_sort_module::{
     MAX_FULL_PATH_LEN, UpdateOutcome, check_chronosort_hash_to_n, chrono_sort_hash_to_n,
-    count_committed_files, lookup_abs_file_path_at_mtime_chronological_index, purge_index_state,
-    update_index,
+    count_committed_files, create_or_update_chrono_index,
+    lookup_abs_file_path_at_mtime_chronological_index, purge_index_state,
 };
 
 // =========================================================================
@@ -323,7 +323,7 @@ fn main() {
     // Phase 1: Build initial index with three files.
     //
     // Because the watched directory may already contain files from prior
-    // runs, update_index may return ColdBuildCompleted (first ever run),
+    // runs, create_or_update_chrono_index may return ColdBuildCompleted (first ever run),
     // NoChangesDetected (if this run's files happen to match the index
     // exactly — impossible with unique prefixes), or
     // IncrementalAppendCompleted (the normal case when prior files are
@@ -348,15 +348,15 @@ fn main() {
         }
     }
 
-    let summary = match update_index(&temp_root, &watched_dir) {
+    let summary = match create_or_update_chrono_index(&temp_root, &watched_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("update_index failed: {}", e.code());
+            eprintln!("create_or_update_chrono_index failed: {}", e.code());
             return;
         }
     };
     println!(
-        "  update_index: outcome={} file_count={}",
+        "  create_or_update_chrono_index: outcome={} file_count={}",
         outcome_label(summary.outcome),
         summary.final_file_count
     );
@@ -420,15 +420,15 @@ fn main() {
 
     println!("\n--- Phase 2: periodic poll — no new files ---");
 
-    let poll_summary = match update_index(&temp_root, &watched_dir) {
+    let poll_summary = match create_or_update_chrono_index(&temp_root, &watched_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("update_index (poll) failed: {}", e.code());
+            eprintln!("create_or_update_chrono_index (poll) failed: {}", e.code());
             return;
         }
     };
     println!(
-        "  update_index: outcome={}",
+        "  create_or_update_chrono_index: outcome={}",
         outcome_label(poll_summary.outcome)
     );
 
@@ -463,15 +463,18 @@ fn main() {
         }
     }
 
-    let append_summary = match update_index(&temp_root, &watched_dir) {
+    let append_summary = match create_or_update_chrono_index(&temp_root, &watched_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("update_index (append) failed: {}", e.code());
+            eprintln!(
+                "create_or_update_chrono_index (append) failed: {}",
+                e.code()
+            );
             return;
         }
     };
     println!(
-        "  update_index: outcome={} file_count={}",
+        "  create_or_update_chrono_index: outcome={} file_count={}",
         outcome_label(append_summary.outcome),
         append_summary.final_file_count
     );
@@ -567,7 +570,7 @@ fn main() {
     println!();
     println!("Summary of Plan-B usage pattern: (not results of demo)");
     println!();
-    println!("  after update_index commits K files:");
+    println!("  after create_or_update_chrono_index commits K files:");
     println!("    stored_hash = chrono_sort_hash_to_n(temp_root, K-1)");
     println!();
     println!("  on each subsequent poll:");

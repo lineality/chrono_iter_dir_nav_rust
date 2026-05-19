@@ -3585,7 +3585,7 @@ mod chrono_index_part_c_tests {
 //
 // This part adds the two functions that callers normally use:
 //
-//   1. `update_index` — brings the on-disk index up to date with the
+//   1. `create_or_update_chrono_index` — brings the on-disk index up to date with the
 //      current contents of the watched directory. Compares the live
 //      directory against the committed `header.bin` and dispatches to:
 //         * nothing (index is already current),
@@ -3655,10 +3655,10 @@ pub struct ChronoLookupResult {
 }
 
 // =========================================================================
-// Public summary type for update_index
+// Public summary type for create_or_update_chrono_index
 // =========================================================================
 
-/// Discrete outcome categories from `update_index`. Carries no user data.
+/// Discrete outcome categories from `create_or_update_chrono_index`. Carries no user data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateOutcome {
     /// No prior committed index existed; a cold build was performed.
@@ -3674,7 +3674,7 @@ pub enum UpdateOutcome {
     IncrementalAppendCompleted,
 }
 
-/// Aggregate summary returned by `update_index`. The numeric fields are
+/// Aggregate summary returned by `create_or_update_chrono_index`. The numeric fields are
 /// 0 for outcomes that did not exercise the corresponding path.
 #[derive(Clone, Copy, Debug)]
 pub struct UpdateSummary {
@@ -3693,7 +3693,7 @@ pub struct UpdateSummary {
 
 /// Probe result for the live directory: total regular-file count and
 /// XOR-fold of FNV-1a 64 over their basenames. Used to decide between
-/// the no-op / incremental / rebuild paths in `update_index`.
+/// the no-op / incremental / rebuild paths in `create_or_update_chrono_index`.
 ///
 /// `entries_skipped_overlong_name`, `entries_skipped_stat_failed`, and
 /// `entries_skipped_non_regular` are tracked here too so the orchestrator
@@ -3807,7 +3807,7 @@ fn data_files_match_header_count(temp_root_dir: &Path, header: &ChronoIndexHeade
 }
 
 // =========================================================================
-// update_index — the high-level orchestration entrypoint
+// create_or_update_chrono_index — the high-level orchestration entrypoint
 // =========================================================================
 
 /// Brings the on-disk index in `<temp_root_dir>/chrono_index/` up to
@@ -3836,7 +3836,7 @@ fn data_files_match_header_count(temp_root_dir: &Path, header: &ChronoIndexHeade
 ///
 /// Per project policy: never halts. Any unrecoverable inconsistency
 /// triggers a cold rebuild rather than an error return.
-pub fn update_index(
+pub fn create_or_update_chrono_index(
     temp_root_dir: &Path,
     parent_directory_to_index: &Path,
 ) -> Result<UpdateSummary, ChronoIndexError> {
@@ -3995,7 +3995,7 @@ pub fn update_index(
     // signal_hash now matches the probe's live_signal_hash. If not,
     // some assumption was violated (e.g. an FNV hash collision causing
     // a conservative skip in the append path); rebuild on the next
-    // update_index call by treating this round as a rebuild.
+    // create_or_update_chrono_index call by treating this round as a rebuild.
     let header_after_append = read_header(temp_root_dir)?.ok_or(ChronoIndexError::AppendIo)?;
     if header_after_append.signal_hash != probe.live_signal_hash
         || header_after_append.file_count != probe.live_file_count
@@ -4179,7 +4179,7 @@ mod chrono_index_part_d_tests {
         let watched =
             make_watched_dir_with_files("first_update", &[("a.txt", b"1"), ("b.txt", b"2")]);
 
-        let summary = update_index(&temp_root, &watched).expect("update ok");
+        let summary = create_or_update_chrono_index(&temp_root, &watched).expect("update ok");
         assert_eq!(summary.outcome, UpdateOutcome::ColdBuildCompleted);
         assert_eq!(summary.final_file_count, 2);
         assert_eq!(summary.cold_build_summary.files_indexed, 2);
@@ -4193,10 +4193,10 @@ mod chrono_index_part_d_tests {
         let temp_root = make_test_temp_root("noop_update");
         let watched = make_watched_dir_with_files("noop_update", &[("x", b"1"), ("y", b"2")]);
 
-        let first = update_index(&temp_root, &watched).expect("first ok");
+        let first = create_or_update_chrono_index(&temp_root, &watched).expect("first ok");
         assert_eq!(first.outcome, UpdateOutcome::ColdBuildCompleted);
 
-        let second = update_index(&temp_root, &watched).expect("second ok");
+        let second = create_or_update_chrono_index(&temp_root, &watched).expect("second ok");
         assert_eq!(second.outcome, UpdateOutcome::NoChangesDetected);
         assert_eq!(second.final_file_count, 2);
 
@@ -4208,12 +4208,13 @@ mod chrono_index_part_d_tests {
     fn update_index_growth_triggers_incremental_append() {
         let temp_root = make_test_temp_root("growth");
         let watched = make_watched_dir_with_files("growth", &[("seed", b"s")]);
-        let _ = update_index(&temp_root, &watched).expect("cold build via update");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("cold build via update");
 
         add_file_to_watched_dir(&watched, "grown_one", b"1");
         add_file_to_watched_dir(&watched, "grown_two", b"2");
 
-        let summary = update_index(&temp_root, &watched).expect("append via update");
+        let summary =
+            create_or_update_chrono_index(&temp_root, &watched).expect("append via update");
         assert_eq!(summary.outcome, UpdateOutcome::IncrementalAppendCompleted);
         assert_eq!(summary.final_file_count, 3);
         assert_eq!(summary.append_summary.files_appended, 2);
@@ -4227,7 +4228,7 @@ mod chrono_index_part_d_tests {
         let temp_root = make_test_temp_root("inconsistent");
         let watched =
             make_watched_dir_with_files("inconsistent", &[("a", b"1"), ("b", b"2"), ("c", b"3")]);
-        let _ = update_index(&temp_root, &watched).expect("first ok");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("first ok");
 
         // Corrupt by truncating names.bin to half size.
         let names_path = build_index_file_path(&temp_root, NAMES_FILENAME);
@@ -4241,7 +4242,8 @@ mod chrono_index_part_d_tests {
             .expect("truncate names");
         drop(truncated_handle);
 
-        let summary = update_index(&temp_root, &watched).expect("rebuild via update");
+        let summary =
+            create_or_update_chrono_index(&temp_root, &watched).expect("rebuild via update");
         assert_eq!(summary.outcome, UpdateOutcome::RebuiltDueToInconsistency);
         assert_eq!(summary.final_file_count, 3);
 
@@ -4255,10 +4257,10 @@ mod chrono_index_part_d_tests {
         let watched_a = make_watched_dir_with_files("reparent_a", &[("aa", b"a")]);
         let watched_b = make_watched_dir_with_files("reparent_b", &[("bb", b"b")]);
 
-        let _ = update_index(&temp_root, &watched_a).expect("first ok");
+        let _ = create_or_update_chrono_index(&temp_root, &watched_a).expect("first ok");
 
         // Now point the same temp_root at a different parent directory.
-        let summary = update_index(&temp_root, &watched_b).expect("rebuild ok");
+        let summary = create_or_update_chrono_index(&temp_root, &watched_b).expect("rebuild ok");
         assert_eq!(summary.outcome, UpdateOutcome::RebuiltDueToInconsistency);
         assert_eq!(summary.final_file_count, 1);
 
@@ -4313,11 +4315,11 @@ mod chrono_index_part_d_tests {
 ///     to a different watched directory and choosing not to reuse the
 ///     same `temp_root_dir`).
 ///   - A higher-level component has decided the index is unrecoverable
-///     and a fresh cold rebuild on the next `update_index` is desired.
+///     and a fresh cold rebuild on the next `create_or_update_chrono_index` is desired.
 ///
 /// Per project policy this function does not halt. On I/O failure it
 /// returns a terse error code; the caller can choose to retry or accept
-/// the leftover state (a subsequent `update_index` will rebuild over it
+/// the leftover state (a subsequent `create_or_update_chrono_index` will rebuild over it
 /// in any case).
 ///
 /// Safety / scope guarantees:
@@ -4521,7 +4523,7 @@ mod chrono_index_lookup_tests {
                 ("third.txt", b"3"),
             ],
         );
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         let mut buf = [0u8; MAX_FULL_PATH_LEN];
         let result = lookup_abs_file_path_at_mtime_chronological_index(&temp_root, 0, &mut buf)
@@ -4539,7 +4541,7 @@ mod chrono_index_lookup_tests {
     fn lookup_past_end_returns_none() {
         let temp_root = make_test_temp_root("past_end");
         let watched = make_watched_dir_with_files("past_end", &[("only", b"x")]);
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         let mut buf = [0u8; MAX_FULL_PATH_LEN];
         let r =
@@ -4555,10 +4557,10 @@ mod chrono_index_lookup_tests {
         let temp_root = make_test_temp_root("count");
         let watched = make_watched_dir_with_files("count", &[("a", b"a"), ("b", b"b")]);
 
-        // Before any update_index, no header → 0.
+        // Before any create_or_update_chrono_index, no header → 0.
         assert_eq!(count_committed_files(&temp_root).expect("ok"), 0);
 
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
         assert_eq!(count_committed_files(&temp_root).expect("ok"), 2);
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -4572,7 +4574,7 @@ mod chrono_index_lookup_tests {
             "ascending",
             &[("p0", b"0"), ("p1", b"1"), ("p2", b"2"), ("p3", b"3")],
         );
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         let total = count_committed_files(&temp_root).expect("ok");
         assert_eq!(total, 4);
@@ -4635,7 +4637,7 @@ mod chrono_index_lookup_tests {
 //
 // ## Plan-B from project discussion — usage pattern
 //
-//   1. After `update_index` commits a new index with file_count == K,
+//   1. After `create_or_update_chrono_index` commits a new index with file_count == K,
 //      call `chrono_sort_hash_to_n(temp_root, K - 1)` and store the
 //      result as `known_good_hash` in caller state.
 //
@@ -4695,7 +4697,7 @@ mod chrono_index_lookup_tests {
 /// ## Arguments
 ///
 /// - `temp_root_dir`: the index temp root — same path passed to
-///   [`update_index`].
+///   [`create_or_update_chrono_index`].
 /// - `up_to_position`: the last (inclusive) chronological position to
 ///   include. Must be `< header.file_count`. If `file_count == 0` or
 ///   `up_to_position >= file_count`, returns `Err(LookupIo)`.
@@ -4865,7 +4867,7 @@ pub fn chrono_sort_hash_to_n(
 /// ## Arguments
 ///
 /// - `temp_root_dir`: the index temp root — same path passed to
-///   [`update_index`].
+///   [`create_or_update_chrono_index`].
 /// - `up_to_position`: the last (inclusive) chronological position to
 ///   include. Must be `< header.file_count`.
 /// - `previous_hash`: the value previously returned by
@@ -4970,7 +4972,7 @@ mod chrono_index_part_g_tests {
             "deterministic",
             &[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")],
         );
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         let hash_first = chrono_sort_hash_to_n(&temp_root, 2).expect("hash ok first");
         let hash_second = chrono_sort_hash_to_n(&temp_root, 2).expect("hash ok second");
@@ -4996,7 +4998,7 @@ mod chrono_index_part_g_tests {
                 ("late.dat", b"l"),
             ],
         );
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         let hash_0 = chrono_sort_hash_to_n(&temp_root, 0).expect("hash pos 0");
         let hash_1 = chrono_sort_hash_to_n(&temp_root, 1).expect("hash pos 1");
@@ -5023,7 +5025,7 @@ mod chrono_index_part_g_tests {
     fn hash_to_n_rejects_position_at_or_past_file_count() {
         let temp_root = make_test_temp_root("out_of_range");
         let watched = make_watched_dir_with_files("out_of_range", &[("only.txt", b"x")]);
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
         // file_count == 1, so valid positions are only 0.
         // position 1 must fail.
         let result = chrono_sort_hash_to_n(&temp_root, 1);
@@ -5073,13 +5075,13 @@ mod chrono_index_part_g_tests {
 
         // Directory A with one file.
         let watched_a = make_watched_dir_with_files("pshift_a", &[("alpha.txt", b"a")]);
-        let _ = update_index(&temp_root, &watched_a).expect("build a");
+        let _ = create_or_update_chrono_index(&temp_root, &watched_a).expect("build a");
         let hash_alpha = chrono_sort_hash_to_n(&temp_root, 0).expect("hash alpha");
 
         // Now index a completely different directory with a different file.
         // This triggers a rebuild (different parent path).
         let watched_b = make_watched_dir_with_files("pshift_b", &[("beta.txt", b"b")]);
-        let _ = update_index(&temp_root, &watched_b).expect("build b");
+        let _ = create_or_update_chrono_index(&temp_root, &watched_b).expect("build b");
         let hash_beta = chrono_sort_hash_to_n(&temp_root, 0).expect("hash beta");
 
         assert_ne!(
@@ -5109,7 +5111,7 @@ mod chrono_index_part_g_tests {
             "order_sensitive_a",
             &[("first.txt", b"f"), ("second.txt", b"s")],
         );
-        let _ = update_index(&temp_root_a, &watched_a).expect("build a");
+        let _ = create_or_update_chrono_index(&temp_root_a, &watched_a).expect("build a");
         // Verify the index has the expected order: position 0's path ends with first.txt.
         let mut buf = [0u8; MAX_FULL_PATH_LEN];
         let r0 = lookup_abs_file_path_at_mtime_chronological_index(&temp_root_a, 0, &mut buf)
@@ -5122,7 +5124,7 @@ mod chrono_index_part_g_tests {
             "order_sensitive_b",
             &[("second.txt", b"s"), ("first.txt", b"f")],
         );
-        let _ = update_index(&temp_root_b, &watched_b).expect("build b");
+        let _ = create_or_update_chrono_index(&temp_root_b, &watched_b).expect("build b");
         let r0b = lookup_abs_file_path_at_mtime_chronological_index(&temp_root_b, 0, &mut buf)
             .expect("ok")
             .expect("present");
@@ -5157,7 +5159,7 @@ mod chrono_index_part_g_tests {
             "prefix_stable",
             &[("file0.dat", b"0"), ("file1.dat", b"1")],
         );
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         // Record hash at position 0 and position 1.
         let hash_at_0 = chrono_sort_hash_to_n(&temp_root, 0).expect("hash 0");
@@ -5165,7 +5167,7 @@ mod chrono_index_part_g_tests {
 
         // Add a new file (appended to the end: position 2).
         add_file(&watched, "file2.dat", b"2");
-        let _ = update_index(&temp_root, &watched).expect("append");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("append");
 
         // Hash at position 0 and 1 must be unchanged: positions 0 and 1
         // were not affected by the append.
@@ -5202,7 +5204,7 @@ mod chrono_index_part_g_tests {
             "check_true",
             &[("move1", b"w"), ("move2", b"b"), ("move3", b"w")],
         );
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         // Record hash for positions 0..=2.
         let stored_hash = chrono_sort_hash_to_n(&temp_root, 2).expect("hash ok");
@@ -5219,7 +5221,7 @@ mod chrono_index_part_g_tests {
     fn check_returns_false_when_stored_hash_does_not_match_current() {
         let temp_root = make_test_temp_root("check_false");
         let watched = make_watched_dir_with_files("check_false", &[("a", b"1"), ("b", b"2")]);
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         // Compute the real hash, then pass a deliberately wrong value
         // as the "previous" hash.
@@ -5239,12 +5241,12 @@ mod chrono_index_part_g_tests {
         // (same temp root), check → must be false.
         let temp_root = make_test_temp_root("check_rebuild");
         let watched_a = make_watched_dir_with_files("check_rebuild_a", &[("alpha", b"a")]);
-        let _ = update_index(&temp_root, &watched_a).expect("build a");
+        let _ = create_or_update_chrono_index(&temp_root, &watched_a).expect("build a");
         let hash_before_rebuild = chrono_sort_hash_to_n(&temp_root, 0).expect("hash before");
 
         // Rebuild against a different watched directory.
         let watched_b = make_watched_dir_with_files("check_rebuild_b", &[("beta", b"b")]);
-        let _ = update_index(&temp_root, &watched_b).expect("build b");
+        let _ = create_or_update_chrono_index(&temp_root, &watched_b).expect("build b");
 
         // check against the pre-rebuild hash must return false.
         let result =
@@ -5265,7 +5267,7 @@ mod chrono_index_part_g_tests {
         // a silent false, which would incorrectly signal "changed").
         let temp_root = make_test_temp_root("check_oob");
         let watched = make_watched_dir_with_files("check_oob", &[("sole", b"x")]);
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
         let result = check_chronosort_hash_to_n(&temp_root, 5, 0xDEAD);
         assert_eq!(result.err(), Some(ChronoIndexError::LookupIo));
@@ -5290,13 +5292,13 @@ mod chrono_index_part_g_tests {
             "plan_b_pattern",
             &[("move01", b"w"), ("move02", b"b"), ("move03", b"w")],
         );
-        let _ = update_index(&temp_root, &watched).expect("build");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
         // K = 3, last position = 2.
         let stored_hash_at_2 = chrono_sort_hash_to_n(&temp_root, 2).expect("initial hash");
 
         // Append move04.
         add_file(&watched, "move04", b"b");
-        let _ = update_index(&temp_root, &watched).expect("append");
+        let _ = create_or_update_chrono_index(&temp_root, &watched).expect("append");
 
         // Positions 0..=2 are unchanged: check must return true.
         let prefix_stable =
