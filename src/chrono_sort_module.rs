@@ -4333,7 +4333,7 @@ mod chrono_index_part_d_tests {
 /// alive until the last handle is closed). The module's own functions
 /// always open + read + close in a single call, so they do not retain
 /// handles between calls.
-pub fn purge_index_state(temp_root_dir: &Path) -> Result<(), ChronoIndexError> {
+pub fn purge_chrono_index_state(temp_root_dir: &Path) -> Result<(), ChronoIndexError> {
     let mut index_subdir = PathBuf::from(temp_root_dir);
     index_subdir.push(INDEX_SUBDIRNAME);
 

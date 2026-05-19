@@ -32,7 +32,7 @@ mod chrono_sort_module;
 use chrono_sort_module::{
     MAX_FULL_PATH_LEN, UpdateOutcome, check_chronosort_hash_to_n, chrono_sort_hash_to_n,
     count_committed_files, create_or_update_chrono_index,
-    lookup_abs_file_path_at_mtime_chronological_index, purge_index_state,
+    lookup_abs_file_path_at_mtime_chronological_index, purge_chrono_index_state,
 };
 
 // =========================================================================
@@ -118,7 +118,7 @@ fn outcome_label(outcome: UpdateOutcome) -> &'static str {
 /// shown so prior-run accumulation is visible.
 ///
 /// Cleanup steps when the user answers yes:
-///   1. `purge_index_state` — removes `<temp_root>/chrono_index/` and
+///   1. `purge_chrono_index_state` — removes `<temp_root>/chrono_index/` and
 ///      all index files inside it.
 ///   2. Remove every regular file inside `watched_dir` (all runs).
 ///   3. Attempt (non-destructively) to remove the now-empty
@@ -181,11 +181,11 @@ fn prompt_cleanup(temp_root: &Path, watched_dir: &Path, this_run_basenames: &[St
     println!("--- cleanup ---");
 
     // Step 1: purge the chrono-sort index state.
-    // purge_index_state removes <temp_root>/chrono_index/ and its
+    // purge_chrono_index_state removes <temp_root>/chrono_index/ and its
     // contents. It does not touch temp_root itself.
-    match purge_index_state(temp_root) {
-        Ok(()) => println!("  purge_index_state: ok"),
-        Err(e) => println!("  purge_index_state: {} (continuing)", e.code()),
+    match purge_chrono_index_state(temp_root) {
+        Ok(()) => println!("  purge_chrono_index_state: ok"),
+        Err(e) => println!("  purge_chrono_index_state: {} (continuing)", e.code()),
     }
 
     // Step 2: remove ALL regular files in the watched directory.
