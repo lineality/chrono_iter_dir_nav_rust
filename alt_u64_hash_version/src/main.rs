@@ -30,44 +30,14 @@ use std::path::{Path, PathBuf};
 mod chrono_sort_module;
 
 use chrono_sort_module::{
-    MAX_FULL_PATH_LEN, PEARSON_SALT_ARRAY_SIZE, UpdateOutcome, check_chronosort_hash_to_n,
-    chrono_sort_hash_to_n, count_committed_files, create_or_update_chrono_index,
+    MAX_FULL_PATH_LEN, UpdateOutcome, check_chronosort_hash_to_n, chrono_sort_hash_to_n,
+    count_committed_files, create_or_update_chrono_index,
     lookup_abs_file_path_at_mtime_chronological_index, purge_chrono_index_state,
 };
 
-// use chrono_sort_search_dir_nav_module::chrono_sort_module::PEARSON_SALT_ARRAY_SIZE;
 // =========================================================================
 // Demo helpers
 // =========================================================================
-
-/// Formats a Pearson hash byte array as an uppercase hex string for
-/// human-readable demo output.
-///
-/// ## Project context
-///
-/// `chrono_sort_hash_to_n` returns `[u8; PEARSON_SALT_ARRAY_SIZE]`,
-/// not a `u64`. The standard `{:016X}` format specifier therefore
-/// does not apply. This helper produces a width-correct hex
-/// representation (two hex digits per byte) so the demo's stdout
-/// output stays informative without misrepresenting the hash's
-/// actual width.
-///
-/// Heap use: one `String` is allocated per call. This is acceptable
-/// here because the function is used only by the demo driver
-/// (`main.rs`), not by any production-path module function. The
-/// library code (`chrono_sort_module.rs`) does not format hash bytes
-/// for output.
-fn format_pearson_hash_as_hex_string(hash_bytes: &[u8; PEARSON_SALT_ARRAY_SIZE]) -> String {
-    // Two ASCII hex chars per byte plus the "0x" prefix.
-    let mut hex_string = String::with_capacity(2 + 2 * hash_bytes.len());
-    hex_string.push_str("0x");
-    for byte_value in hash_bytes.iter() {
-        // {:02X} = two uppercase hex digits, zero-padded. Operates on
-        // a u8, which DOES implement UpperHex.
-        hex_string.push_str(&format!("{:02X}", byte_value));
-    }
-    hex_string
-}
 
 /// Resolves `<cargo_manifest_dir>/test/<subdir>`, creating the directory
 /// if absent. Demo-only; not used by the index module itself.
@@ -414,9 +384,8 @@ fn main() {
         }
     };
     println!(
-        "\n  chrono_sort_hash_to_n(position={}) = {}",
-        last_position_phase1,
-        format_pearson_hash_as_hex_string(&stored_hash)
+        "\n  chrono_sort_hash_to_n(position={}) = 0x{:016X}",
+        last_position_phase1, stored_hash
     );
     println!(
         "  (engine stores this hash after processing all {} committed files)",
@@ -465,10 +434,9 @@ fn main() {
 
     match check_chronosort_hash_to_n(&temp_root, last_position_phase1, stored_hash) {
         Ok(true) => println!(
-            "  check_chronosort_hash_to_n(position={}, hash={})\n  \
-                    -> Ok(true)  past sequence INTACT — no rebuild needed",
-            last_position_phase1,
-            format_pearson_hash_as_hex_string(&stored_hash)
+            "  check_chronosort_hash_to_n(position={}, hash=0x{:016X})\n  \
+             -> Ok(true)  past sequence INTACT — no rebuild needed",
+            last_position_phase1, stored_hash
         ),
         Ok(false) => println!(
             "  check_chronosort_hash_to_n\n  \
@@ -514,10 +482,10 @@ fn main() {
     // The prefix (positions 0..=last_position_phase1) must be unchanged.
     match check_chronosort_hash_to_n(&temp_root, last_position_phase1, stored_hash) {
         Ok(true) => println!(
-            "  check_chronosort_hash_to_n(position={}, hash=0x{})\n  \
+            "  check_chronosort_hash_to_n(position={}, hash=0x{:016X})\n  \
              -> Ok(true)  prefix INTACT — engine reads only new move at position {}",
             last_position_phase1,
-            format_pearson_hash_as_hex_string(&stored_hash),
+            stored_hash,
             append_summary.final_file_count.saturating_sub(1)
         ),
         Ok(false) => println!(
@@ -545,9 +513,8 @@ fn main() {
         }
     };
     println!(
-        "  chrono_sort_hash_to_n(position={}) = {}  (updated stored hash)",
-        last_position_phase3,
-        format_pearson_hash_as_hex_string(&stored_hash_phase3)
+        "  chrono_sort_hash_to_n(position={}) = 0x{:016X}  (updated stored hash)",
+        last_position_phase3, stored_hash_phase3
     );
 
     // =========================================================================
@@ -566,17 +533,15 @@ fn main() {
 
     match check_chronosort_hash_to_n(&temp_root, last_position_phase3, stored_hash) {
         Ok(true) => println!(
-            "  check(position={}, stale_hash={})\n  \
-                    -> Ok(true)  (unexpected: hash collision or ...",
-            last_position_phase3,
-            format_pearson_hash_as_hex_string(&stored_hash)
+            "  check(position={}, stale_hash=0x{:016X})\n  \
+             -> Ok(true)  (unexpected: hash collision or sequences happen to match)",
+            last_position_phase3, stored_hash
         ),
         Ok(false) => println!(
-            "  check(position={}, stale_hash=0x{})\n  \
+            "  check(position={}, stale_hash=0x{:016X})\n  \
              -> Ok(false) CHANGE DETECTED — stale hash does not cover the new position\n  \
              engine discards state and rebuilds from position 0",
-            last_position_phase3,
-            format_pearson_hash_as_hex_string(&stored_hash)
+            last_position_phase3, stored_hash
         ),
         Err(e) => eprintln!("  check error: {}", e.code()),
     }

@@ -70,68 +70,8 @@
 //! - No unsafe code.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Error, ErrorKind};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-
-// =========================================================================
-// Pearson hashing — single source of all hashing in this module
-// =========================================================================
-//
-// ## Project context
-//
-// This module previously used FNV-1a 64-bit hashing in three roles
-// (header signal_hash, name_hashes.bin sidecar, and chrono_sort_hash_to_n).
-// That was out of spec: the project's policy is to use the existing
-// Pearson hashing module (`pearson_hash_salt_array`) and its compile-
-// time-generated permutation table (`GENERATED_TABLE`). FNV-1a has
-// been removed; all hashing here now flows through Pearson.
-//
-// ## Width
-//
-// `PEARSON_SALT_ARRAY_SIZE` controls the byte-width of every hash this
-// module produces — signal_hash, per-record sidecar entry, and the
-// chronological-sequence hash. A single constant keeps the three
-// roles uniform and easy to retune. Increase for lower collision odds
-// at small storage cost. Decrease for tighter on-disk size at the cost
-// of more frequent collisions (which manifest as extra rebuilds, not
-// as data loss — see the project README's "What is the outcome of a
-// hash collision?" discussion).
-//
-// At width 2: 1-in-65,536 odds per comparison. For the chess-game use
-// case (file counts in the tens), this means essentially never. For
-// directories with millions of files, raise to 3 or 4.
-//
-// ## Salts
-//
-// Three independent fixed salt arrays so the three roles are
-// statistically uncorrelated. The salt values themselves are not
-// secret — Pearson hashing is non-cryptographic — but they must
-// remain stable across runs because they affect the on-disk format
-// (signal_hash in the header, and every record in
-// name_hashes.bin). Changing any salt value requires a HEADER_VERSION
-// bump so existing indices are detected as out-of-format and rebuilt.
-
-/// Byte-width of every Pearson hash produced by this module. Controls
-/// signal_hash width in the header, name_hashes.bin record width, and
-/// chrono_sort_hash_to_n output width simultaneously. See section docs
-/// above for the collision/storage trade-off.
-pub const PEARSON_SALT_ARRAY_SIZE: usize = 2;
-
-/// Per-lane salt bytes for Role 1 (header signal_hash XOR-fold over
-/// basenames). Independent of NAME_HASH_SALTS and CHRONO_SORT_HASH_SALTS
-/// so the three roles produce statistically uncorrelated outputs.
-const SIGNAL_HASH_SALTS: [u8; PEARSON_SALT_ARRAY_SIZE] = [0x5A, 0xA5];
-
-/// Per-lane salt bytes for Role 2 (per-basename entry stored in
-/// name_hashes.bin). Independent of SIGNAL_HASH_SALTS and
-/// CHRONO_SORT_HASH_SALTS.
-const NAME_HASH_SALTS: [u8; PEARSON_SALT_ARRAY_SIZE] = [0x3C, 0xC3];
-
-/// Per-lane salt bytes for Role 3 (running chronological-sequence
-/// hash returned by chrono_sort_hash_to_n). Independent of
-/// SIGNAL_HASH_SALTS and NAME_HASH_SALTS.
-const CHRONO_SORT_HASH_SALTS: [u8; PEARSON_SALT_ARRAY_SIZE] = [0x69, 0x96];
 
 // =========================================================================
 // Public constants — file layout
@@ -286,24 +226,10 @@ pub struct ChronoIndexHeader {
     /// `names.bin` and `mtimes.bin`. Monotonically non-decreasing.
     pub file_count: u64,
 
-    /// Order-independent signal hash of all indexed basenames.
-    ///
-    /// Each basename is hashed with `pearson_hash_salt_array` using
-    /// `SIGNAL_HASH_SALTS` over `GENERATED_TABLE`, producing
-    /// `PEARSON_SALT_ARRAY_SIZE` bytes. The per-basename results are
-    /// XOR-folded lane-by-lane into this accumulator.
-    ///
-    /// Width is governed by `PEARSON_SALT_ARRAY_SIZE`. The on-disk
-    /// header reserves a fixed 8-byte slot for this field; the first
-    /// `PEARSON_SALT_ARRAY_SIZE` bytes carry the hash and the rest are
-    /// zero padding (kept deterministic so the header is byte-stable).
-    ///
-    /// Used to cheaply detect whether the directory contents have
-    /// diverged from the index between runs. The check is
-    /// order-independent: a directory whose files swap chronological
-    /// positions produces the same signal_hash. Order-sensitive
-    /// detection is provided separately by `chrono_sort_hash_to_n`.
-    pub signal_hash: [u8; PEARSON_SALT_ARRAY_SIZE],
+    /// Order-independent signal hash of all indexed basenames
+    /// (XOR-reduce of per-name FNV-1a 64). Used to cheaply detect whether
+    /// the directory contents have diverged from the index between runs.
+    pub signal_hash: u64,
 
     /// mtime of the newest indexed file (largest sort key in `mtimes.bin`).
     /// Used to validate the "new files have newer mtimes" invariant at
@@ -351,7 +277,7 @@ impl ChronoIndexHeader {
 
         Ok(ChronoIndexHeader {
             file_count: 0,
-            signal_hash: [0u8; PEARSON_SALT_ARRAY_SIZE],
+            signal_hash: 0,
             // Sentinel: any real mtime will compare strictly greater than this.
             last_mtime_sec: i64::MIN,
             last_mtime_nsec: 0,
@@ -381,18 +307,7 @@ impl ChronoIndexHeader {
         output_buffer[0..8].copy_from_slice(&HEADER_MAGIC);
         output_buffer[8..12].copy_from_slice(&HEADER_VERSION.to_le_bytes());
         output_buffer[12..20].copy_from_slice(&self.file_count.to_le_bytes());
-
-        // signal_hash occupies the first PEARSON_SALT_ARRAY_SIZE bytes of
-        // the 8-byte slot at offset 20. The remaining bytes of the slot
-        // are left as the zero already written by the buffer-zeroing pass
-        // at the top of this function, so the on-disk header is byte-
-        // stable for any PEARSON_SALT_ARRAY_SIZE <= 8.
-
-        #[cfg(debug_assertions)]
-        debug_assert!(PEARSON_SALT_ARRAY_SIZE <= 8);
-
-        output_buffer[20..20 + PEARSON_SALT_ARRAY_SIZE].copy_from_slice(&self.signal_hash);
-
+        output_buffer[20..28].copy_from_slice(&self.signal_hash.to_le_bytes());
         output_buffer[28..36].copy_from_slice(&self.last_mtime_sec.to_le_bytes());
         output_buffer[36..40].copy_from_slice(&self.last_mtime_nsec.to_le_bytes());
         output_buffer[40..48].copy_from_slice(&self.invariant_breach_count.to_le_bytes());
@@ -430,14 +345,8 @@ impl ChronoIndexHeader {
         u64_buffer.copy_from_slice(&input_buffer[12..20]);
         let file_count = u64::from_le_bytes(u64_buffer);
 
-        // signal_hash is the first PEARSON_SALT_ARRAY_SIZE bytes of the
-        // 8-byte slot at offset 20. Remaining bytes of the slot are
-        // reserved (zero) and ignored on read so future widenings up to
-        // 8 are forward-compatible at the layout level (semantics still
-        // require HEADER_VERSION to be bumped on any width change).
-        let mut signal_hash_bytes = [0u8; PEARSON_SALT_ARRAY_SIZE];
-        signal_hash_bytes.copy_from_slice(&input_buffer[20..20 + PEARSON_SALT_ARRAY_SIZE]);
-        let signal_hash = signal_hash_bytes;
+        u64_buffer.copy_from_slice(&input_buffer[20..28]);
+        let signal_hash = u64::from_le_bytes(u64_buffer);
 
         let mut i64_buffer = [0u8; 8];
         i64_buffer.copy_from_slice(&input_buffer[28..36]);
@@ -472,547 +381,6 @@ impl ChronoIndexHeader {
             parent_path: parent_path_buffer,
         })
     }
-}
-
-// =========================================================================
-// Pearson Salt Hash Functions
-// =========================================================================
-
-/// Computes the per-basename hash used by Role 1 (signal_hash fold)
-/// and Role 2 (name_hashes.bin sidecar entry). Role 1 and Role 2 use
-/// independent salt arrays so their outputs are not correlated.
-fn pearson_hash_basename_for_signal(
-    basename_bytes: &[u8],
-) -> Result<[u8; PEARSON_SALT_ARRAY_SIZE], ChronoIndexError> {
-    match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-        basename_bytes,
-        &SIGNAL_HASH_SALTS,
-        &GENERATED_TABLE,
-    ) {
-        Ok(hash_bytes) => Ok(hash_bytes),
-        Err(_) => Err(ChronoIndexError::BuildIo),
-    }
-}
-
-fn pearson_hash_basename_for_name_sidecar(
-    basename_bytes: &[u8],
-) -> Result<[u8; PEARSON_SALT_ARRAY_SIZE], ChronoIndexError> {
-    match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-        basename_bytes,
-        &NAME_HASH_SALTS,
-        &GENERATED_TABLE,
-    ) {
-        Ok(hash_bytes) => Ok(hash_bytes),
-        Err(_) => Err(ChronoIndexError::AppendIo),
-    }
-}
-
-/// In-place XOR: accumulator ^= addend, lane by lane.
-fn xor_into_accumulator(
-    accumulator: &mut [u8; PEARSON_SALT_ARRAY_SIZE],
-    addend: &[u8; PEARSON_SALT_ARRAY_SIZE],
-) {
-    for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-        accumulator[lane_index] ^= addend[lane_index];
-    }
-}
-
-// =============================================================================
-// SECTION 2: Generated Permutation Table (compile-time Fisher-Yates)
-// =============================================================================
-
-/// The fixed seed used to deterministically generate `GENERATED_TABLE`.
-///
-/// ## Project-Level Context
-///
-/// Changing this seed produces a different table. The seed is fixed
-/// here so that every build of this crate produces byte-identical
-/// hashes for the same input — this is required for any downstream
-/// consumer that persists hash values (e.g. Bloom filters on disk).
-///
-/// The specific value `0x9E37_79B9_7F4A_7C15` is the 64-bit golden-ratio
-/// constant (the same constant used by `splitmix64` and many other
-/// PRNG initializers). It has no special cryptographic meaning here;
-/// it is simply a well-mixed, well-known nonzero constant.
-// const GENERATED_TABLE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-// const GENERATED_TABLE_SEED: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-// (chess-board-tested seed) 0x1424_1312_FCC6_8202,  base chi2 == 163.52
-const GENERATED_TABLE_SEED: u64 = 0x1424_1312_FCC6_8202;
-
-/// A 256-byte permutation table generated at compile time via seeded
-/// Fisher-Yates shuffle.
-///
-/// ## Project-Level Context
-///
-/// This is the recommended default for new code that does not need
-/// 1990-compatibility. Its construction is fully transparent:
-///
-/// 1. Start with the identity permutation `[0, 1, 2, ..., 255]`.
-/// 2. Run Fisher-Yates (Knuth shuffle) using a documented `splitmix64`
-///    PRNG seeded by `GENERATED_TABLE_SEED`.
-///
-/// Both the algorithm and the seed are documented in source, so any
-/// reader can independently reconstruct this exact table.
-///
-/// ## Validation
-///
-/// `pearson_hash_tools.rs` provides a quality-evaluation module that
-/// scores this table against `PEARSON_1990_TABLE` on six metrics
-/// (fixed-point count, cycle structure, displacement, sequential
-/// correlation, XOR uniformity, empirical collisions). The integration
-/// tests in `main.rs` confirm this generated table meets or exceeds
-/// the 1990 baseline on every metric.
-pub const GENERATED_TABLE: [u8; 256] = generate_table_fisher_yates_const(GENERATED_TABLE_SEED);
-
-/// Const-fn Fisher-Yates shuffle producing a permutation of `0..=255`.
-///
-/// ## What This Function Does
-///
-/// 1. Initializes a `[u8; 256]` to the identity permutation
-///    (`table[i] = i`).
-/// 2. Walks `i` from `255` down to `1`, picks a pseudo-random index
-///    `j` in `0..=i` using a `splitmix64`-style PRNG, and swaps
-///    `table[i]` with `table[j]`.
-///
-/// This is the standard Fisher-Yates / Knuth shuffle. With a fixed
-/// seed it is fully deterministic.
-///
-/// ## Project-Level Context
-///
-/// Marked `const fn` so the table is computed at compile time and
-/// embedded directly into the binary's read-only data section. There
-/// is zero runtime cost.
-///
-/// ## PRNG Choice
-///
-/// A minimal `splitmix64` step is used as the PRNG:
-///
-/// ```text
-///     state = state + 0x9E3779B97F4A7C15
-///     z = state
-///     z = (z XOR (z >> 30)) * 0xBF58476D1CE4E5B9
-///     z = (z XOR (z >> 27)) * 0x94D049BB133111EB
-///     z = z XOR (z >> 31)
-/// ```
-///
-/// `splitmix64` is well-studied, passes BigCrush, has 64 bits of state
-/// (more than enough for a 256-element shuffle), and is trivial to
-/// implement as a `const fn`. It is **not** cryptographically secure,
-/// which is acceptable because the resulting table is public anyway.
-///
-/// ## Why Not the 1990 Table?
-///
-/// The 1990 table is hand-typed from a 1990 typescript. While it
-/// passes statistical tests well, a generated table from a documented
-/// algorithm is more auditable: any reader can reproduce it from
-/// first principles.
-///
-/// ## Arguments
-///
-/// * `seed` — 64-bit PRNG seed. Different seeds produce different
-///   tables; the same seed always produces the same table.
-///
-/// ## Returns
-///
-/// A `[u8; 256]` that is guaranteed (by construction) to be a valid
-/// permutation of `0..=255`.
-pub const fn generate_table_fisher_yates_const(seed: u64) -> [u8; 256] {
-    // Step 1: build the identity permutation.
-    let mut table: [u8; 256] = [0u8; 256];
-    let mut init_index: usize = 0;
-    while init_index < 256 {
-        // Cast is safe: init_index < 256 so it fits in a u8.
-        table[init_index] = init_index as u8;
-        init_index += 1;
-    }
-
-    // Step 2: Fisher-Yates shuffle, walking high-to-low.
-    //
-    // PRNG state advances once per swap. We use `wrapping_*` arithmetic
-    // throughout so const evaluation cannot overflow-panic.
-    let mut prng_state: u64 = seed;
-    let mut high_index: usize = 255;
-    while high_index > 0 {
-        // Advance splitmix64 PRNG.
-        prng_state = prng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z: u64 = prng_state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z = z ^ (z >> 31);
-
-        // Reduce the 64-bit random word into `0..=high_index`.
-        // `high_index + 1` is at most 256, which fits in u64 trivially.
-        // Modulo bias is negligible for a 64-bit value reduced into a
-        // range of at most 256.
-        let swap_target: usize = (z % ((high_index as u64) + 1)) as usize;
-
-        // Swap table[high_index] and table[swap_target].
-        let temp_value: u8 = table[high_index];
-        table[high_index] = table[swap_target];
-        table[swap_target] = temp_value;
-
-        high_index -= 1;
-    }
-
-    table
-}
-
-// =============================================================================
-// SECTION 3: Base Pearson Hash (production function)
-// =============================================================================
-
-/// Compute the 8-bit Pearson hash of `input` using `table`.
-///
-/// ## Project-Level Context
-///
-/// This is the core building block of the entire module. The
-/// salt-array variant is implemented in terms of the same inner loop,
-/// inlined for stack-only operation. External callers typically use
-/// this directly when an 8-bit hash is sufficient (e.g. selecting one
-/// of 256 hash buckets).
-///
-/// ## Algorithm
-///
-/// ```text
-///     hash = 0
-///     for byte in input:
-///         hash = table[hash XOR byte]
-///     return hash
-/// ```
-///
-/// The table indexing is always in-bounds because `hash` and `byte`
-/// are both `u8`, so `hash ^ byte` is a `u8` in `0..=255`, and
-/// `table.len() == 256`.
-///
-/// ## Arguments
-///
-/// * `input` — Slice of bytes to hash. Must be non-empty.
-/// * `table` — Reference to a 256-byte permutation table. The caller
-///   chooses which table (`PEARSON_1990_TABLE`, `GENERATED_TABLE`, or
-///   a custom one).
-///
-/// ## Returns
-///
-/// * `Ok(u8)` — the Pearson hash of `input`.
-/// * `Err(std::io::Error)` with `ErrorKind::InvalidInput` and message
-///   `"PHB: empty input"` — if `input` is empty.
-///
-/// ## Why Reject Empty Input?
-///
-/// Mathematically the Pearson hash of an empty string is the initial
-/// value of `hash`, which is `0`. But returning `0` for empty input
-/// is a silent failure mode: it collides with every legitimate input
-/// that happens to hash to `0`. Per project rules ("check returns,
-/// check bounds"), we surface this case as an explicit error so the
-/// caller decides how to handle it.
-///
-/// ## Error Message Convention
-///
-/// All error messages from this function are prefixed `"PHB:"`
-/// (Pearson Hash Base) so log readers can identify the source
-/// function without leaking source paths.
-///
-/// ## Examples
-///
-/// ```ignore
-/// use pearson_hash_salt_array_rust::{pearson_hash_base, PEARSON_1990_TABLE};
-///
-/// let h = pearson_hash_base(b"hello", &PEARSON_1990_TABLE)?;
-/// assert!(h <= 255); // always true, h is u8
-/// # Ok::<(), std::io::Error>(())
-/// ```
-pub fn pearson_hash_base(input: &[u8], table: &[u8; 256]) -> Result<u8, Error> {
-    // =========================================================
-    // Debug-Assert, Test-Assert, Production-Catch-Handle
-    // =========================================================
-
-    // Debug-only invariant: table length is enforced by the type
-    // `&[u8; 256]`, so it cannot be wrong, but we assert it during
-    // debug builds (not test builds) as a tripwire against future
-    // refactors that might loosen the type.
-    #[cfg(all(debug_assertions, not(test)))]
-    debug_assert!(table.len() == 256, "PHB: table length invariant");
-
-    // Test-only assertion mirroring the production check below.
-    // Kept here so `cargo test --release` still exercises it.
-    #[cfg(test)]
-    assert!(table.len() == 256, "PHB: table length invariant");
-
-    // Production check: never panic, return Err and let the caller
-    // decide. Empty-input handling per docstring above.
-    if input.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidInput, "PHB: empty input"));
-    }
-
-    // Core Pearson loop. Bounded by `input.len()`, which is finite.
-    // No heap, no recursion, no panics: index is always in-bounds
-    // because `(hash ^ byte) as usize` is in `0..=255` and
-    // `table` is `[u8; 256]`.
-    let mut running_hash: u8 = 0;
-    for &current_byte in input {
-        let table_index: usize = (running_hash ^ current_byte) as usize;
-        running_hash = table[table_index];
-    }
-
-    Ok(running_hash)
-}
-
-// =============================================================================
-// SECTION 4: Salt-Array Pearson Hash (production function, stack-only)
-// =============================================================================
-
-/// Compute an `N`-byte Pearson hash array by combining one input with
-/// `N` salts, producing one Pearson hash per salt.
-///
-/// ## Project-Level Context
-///
-/// This is the headline function of the module. The pattern "one
-/// input + several independent salts → several independent hashes" is
-/// the standard way to build Bloom filters, count-min sketches,
-/// HyperLogLog-style structures, and consistent-hash dispersal from
-/// a single small hash primitive.
-///
-/// ### Why a Const-Generic `N`?
-///
-/// `N` is the number of salts (and therefore the number of output
-/// bytes). Making it a const generic means:
-///
-/// - The output is `[u8; N]` on the stack — **no heap**.
-/// - The size of the output is part of the type, so callers cannot
-///   accidentally truncate or misread it.
-/// - The compiler unrolls and inlines the per-salt loop where
-///   profitable.
-///
-/// ### Why No Concatenation?
-///
-/// A naive implementation would, for each salt, allocate a `Vec`,
-/// copy `input` into it, append the salt's byte, and hash the buffer.
-/// That allocates `N` `Vec`s of size `input.len() + 1` and bounds
-/// the maximum input length to whatever fits in memory.
-///
-/// Pearson hashing is **inherently sequential**: the running hash
-/// state after consuming `input` is identical regardless of what
-/// comes next. So we can:
-///
-/// 1. Hash `input` **once**, getting a base running-hash byte.
-/// 2. For each salt, **continue** the same algorithm with the salt's
-///    single byte, starting from the base running-hash.
-///
-/// The result is identical to "concatenate input and salt, then hash"
-/// but uses **zero heap**, runs the input bytes exactly once total
-/// (rather than `N` times), and has no input-length bound beyond
-/// what `&[u8]` itself allows.
-///
-/// ## Algorithm
-///
-/// ```text
-///     base = pearson_hash_base(input, table)   // hash the input once
-///     for i in 0..N:
-///         h = base
-///         h = table[h XOR salts[i]]            // one step per salt
-///         output[i] = h
-///     return output
-/// ```
-///
-/// ## Salt Encoding
-///
-/// Salts are `u8` values. Each salt is used directly as a single
-/// byte in one Pearson step. No byte-order conversion is needed or
-/// performed: a `u8` has no endianness. This means hashes computed
-/// by this crate are identical across all host architectures for
-/// the same salt values.
-///
-/// ## Arguments
-///
-/// * `input` — Bytes to hash. Must be non-empty.
-/// * `salts` — A `&[u8; N]` reference. The caller controls `N` and
-///   the salt values. Each salt is one byte and produces one output
-///   byte. `N` must be at least 1 (enforced at the type level —
-///   `[u8; 0]` would compile but is rejected at runtime).
-/// * `table` — Permutation table to use (e.g. `&PEARSON_1990_TABLE`
-///   or `&GENERATED_TABLE`).
-///
-/// ## Returns
-///
-/// * `Ok([u8; N])` — array of `N` Pearson-hash bytes, one per salt,
-///   in the same order as the salts.
-/// * `Err(std::io::Error)` with prefix `"PHSA:"` (Pearson Hash Salt
-///   Array) on:
-///   - empty `input` (`"PHSA: empty input"`)
-///   - `N == 0` (`"PHSA: zero salts"`)
-///
-/// ## Examples
-///
-/// ```ignore
-/// use pearson_hash_salt_array_rust::{pearson_hash_salt_array, PEARSON_1990_TABLE};
-///
-/// let salts: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
-/// let hashes: [u8; 4] = pearson_hash_salt_array(b"hello", &salts, &PEARSON_1990_TABLE)?;
-/// # Ok::<(), std::io::Error>(())
-/// ```
-pub fn pearson_hash_salt_array<const N: usize>(
-    input: &[u8],
-    salts: &[u8; N],
-    table: &[u8; 256],
-) -> Result<[u8; N], Error> {
-    // =========================================================
-    // Debug-Assert, Test-Assert, Production-Catch-Handle
-    // =========================================================
-    //
-    // The two production cases are: empty input, and N == 0.
-    // Both are checked-and-handled below without panicking.
-
-    #[cfg(all(debug_assertions, not(test)))]
-    {
-        debug_assert!(N > 0, "PHSA: zero salts (debug)");
-        debug_assert!(table.len() == 256, "PHSA: table length invariant (debug)");
-    }
-
-    #[cfg(test)]
-    {
-        assert!(table.len() == 256, "PHSA: table length invariant (test)");
-    }
-
-    // Production check: N == 0 means an empty output array, which is
-    // meaningless and almost certainly a caller bug. Reject explicitly.
-    if N == 0 {
-        return Err(Error::new(ErrorKind::InvalidInput, "PHSA: zero salts"));
-    }
-
-    // Production check: empty input. Same reasoning as in
-    // `pearson_hash_base` — empty input would produce a deterministic
-    // value that collides with legitimate inputs.
-    if input.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidInput, "PHSA: empty input"));
-    }
-
-    // --------------------------------------------------------------
-    // Step 1: Hash the input ONCE, producing the "base" running hash.
-    //
-    // This is the state of the Pearson algorithm immediately after
-    // consuming `input` but before consuming any salt bytes. Every
-    // per-salt hash starts from this same base, so we save (N-1)
-    // re-traversals of `input`.
-    // --------------------------------------------------------------
-    let mut base_running_hash: u8 = 0;
-    for &input_byte in input {
-        let table_index: usize = (base_running_hash ^ input_byte) as usize;
-        base_running_hash = table[table_index];
-    }
-
-    // --------------------------------------------------------------
-    // Step 2: For each salt, continue the Pearson loop using the
-    // salt byte directly, and store the resulting byte.
-    //
-    // Each salt is exactly one byte, so the Pearson step for a
-    // salt is a single XOR followed by a single table lookup.
-    // No byte-encoding step is needed: a u8 has no byte order,
-    // so hashes are bit-identical across all host architectures.
-    //
-    // Each salt is exactly one byte, so the Pearson step for a
-    // salt is a single XOR followed by a single table lookup.
-    // No byte-encoding step is required and no endianness
-    // conversion is involved: a u8 has no byte order.
-    //
-    // Output array is stack-allocated `[u8; N]`. No heap.
-    // Outer loop is bounded by N (a compile-time constant).
-    // All loops are firmly bounded per project rules.
-    //
-    // Correctness invariant: `salts[salt_index]` is a u8 and
-    // `salted_running_hash` is a u8, so their XOR is a u8 in
-    // 0..=255, which is always a valid index into `table: [u8; 256]`.
-    // This cannot panic or go out of bounds.
-    // --------------------------------------------------------------
-    let mut output_hashes: [u8; N] = [0u8; N];
-
-    for salt_index in 0..N {
-        // Start from the saved post-input hash state.
-        // Each salt gets its own independent continuation from
-        // `base_running_hash`; salts do not chain into each other.
-        let mut salted_running_hash: u8 = base_running_hash;
-
-        // Retrieve this salt's single byte.
-        let salt_byte: u8 = salts[salt_index];
-
-        // Single Pearson step: XOR the running hash with the salt
-        // byte, then look up the result in the permutation table.
-        let xor_result: u8 = salted_running_hash ^ salt_byte;
-        let table_index: usize = xor_result as usize;
-        salted_running_hash = table[table_index];
-
-        output_hashes[salt_index] = salted_running_hash;
-    }
-
-    Ok(output_hashes)
-}
-
-// =============================================================================
-// SECTION 5: Internal utility — permutation validity check
-// =============================================================================
-
-/// Verify that `table` is a valid permutation of `0..=255`.
-///
-/// ## Project-Level Context
-///
-/// Both `PEARSON_1990_TABLE` and `GENERATED_TABLE` are guaranteed to be
-/// valid permutations by construction (the 1990 table is hand-verified;
-/// the generated table is produced by Fisher-Yates, which provably
-/// preserves the permutation invariant). This function exists to
-/// **prove** that invariant at test time, and to allow callers who
-/// build their own tables to validate them before use.
-///
-/// A "valid permutation" means every byte value in `0..=255` appears
-/// exactly once. The check uses a 256-bit presence bitmap (32 bytes
-/// on the stack) so it allocates nothing.
-///
-/// ## Why It Matters
-///
-/// If a table has a duplicate value, then some byte in `0..=255` is
-/// missing, and the Pearson hash can never produce that byte as an
-/// output — silently shrinking the hash range and creating biased
-/// collisions. The "two strings differing in one byte never collide"
-/// property of Pearson hashing depends critically on the table being
-/// a true permutation.
-///
-/// ## Arguments
-///
-/// * `table` — Reference to the 256-byte table to validate.
-///
-/// ## Returns
-///
-/// * `true` if every value `0..=255` appears exactly once.
-/// * `false` otherwise.
-///
-/// ## Note
-///
-/// This is `pub` because it is genuinely useful to external callers
-/// constructing custom tables. It does not allocate and is safe to
-/// call from production code if desired.
-pub fn is_valid_permutation(table: &[u8; 256]) -> bool {
-    // 32-byte bitmap, one bit per possible value 0..=255.
-    let mut presence_bitmap: [u8; 32] = [0u8; 32];
-
-    // Walk every entry and set its corresponding bit. If a bit is
-    // already set, we have a duplicate, so the table is not a
-    // permutation.
-    let mut entry_index: usize = 0;
-    while entry_index < 256 {
-        let value: u8 = table[entry_index];
-        let byte_index: usize = (value as usize) >> 3; // value / 8
-        let bit_mask: u8 = 1u8 << ((value as usize) & 7); // 1 << (value % 8)
-
-        if (presence_bitmap[byte_index] & bit_mask) != 0 {
-            // Duplicate value detected.
-            return false;
-        }
-        presence_bitmap[byte_index] |= bit_mask;
-
-        entry_index += 1;
-    }
-
-    // If we set 256 distinct bits with no collision, every value
-    // 0..=255 must be present exactly once.
-    true
 }
 
 // =========================================================================
@@ -1225,7 +593,7 @@ mod chrono_index_part_a_tests {
         let header =
             ChronoIndexHeader::new_for_parent(b"/var/data/watched").expect("valid parent path");
         assert_eq!(header.file_count, 0);
-        assert_eq!(header.signal_hash, [0u8; PEARSON_SALT_ARRAY_SIZE]);
+        assert_eq!(header.signal_hash, 0);
         assert_eq!(header.last_mtime_sec, i64::MIN);
         assert_eq!(header.last_mtime_nsec, 0);
         assert_eq!(header.invariant_breach_count, 0);
@@ -1236,13 +604,7 @@ mod chrono_index_part_a_tests {
     fn serialize_then_deserialize_round_trips() {
         let mut original = ChronoIndexHeader::new_for_parent(b"/some/dir").expect("valid path");
         original.file_count = 123_456;
-        // Fill every lane with a distinct nonzero byte so the round-trip
-        // exercises all PEARSON_SALT_ARRAY_SIZE bytes, not just the first.
-        let mut sample_signal_hash = [0u8; PEARSON_SALT_ARRAY_SIZE];
-        for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-            sample_signal_hash[lane_index] = 0xA0u8.wrapping_add(lane_index as u8);
-        }
-        original.signal_hash = sample_signal_hash;
+        original.signal_hash = 0xDEAD_BEEF_CAFE_BABE;
         original.last_mtime_sec = 1_700_000_000;
         original.last_mtime_nsec = 999_999_999;
         original.invariant_breach_count = 7;
@@ -1330,11 +692,7 @@ mod chrono_index_part_a_tests {
         let mut original =
             ChronoIndexHeader::new_for_parent(b"/data/observed").expect("valid path");
         original.file_count = 42;
-        let mut sample_signal_hash = [0u8; PEARSON_SALT_ARRAY_SIZE];
-        for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-            sample_signal_hash[lane_index] = 0x10u8.wrapping_add(lane_index as u8);
-        }
-        original.signal_hash = sample_signal_hash;
+        original.signal_hash = 0x1122_3344_5566_7788;
         original.last_mtime_sec = 1_700_123_456;
         original.last_mtime_nsec = 250_000_000;
         original.invariant_breach_count = 2;
@@ -1345,7 +703,7 @@ mod chrono_index_part_a_tests {
             .expect("header present");
 
         assert_eq!(recovered.file_count, 42);
-        assert_eq!(recovered.signal_hash, sample_signal_hash);
+        assert_eq!(recovered.signal_hash, 0x1122_3344_5566_7788);
         assert_eq!(recovered.last_mtime_sec, 1_700_123_456);
         assert_eq!(recovered.last_mtime_nsec, 250_000_000);
         assert_eq!(recovered.invariant_breach_count, 2);
@@ -1478,6 +836,33 @@ impl MtimeRecord {
         }
         self.record_id < other.record_id
     }
+}
+
+// =========================================================================
+// FNV-1a 64 — small, allocation-free, used for the order-independent
+// `signal_hash` over basenames.
+// =========================================================================
+
+/// FNV-1a 64-bit offset basis.
+const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64-bit prime.
+const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Computes the FNV-1a 64-bit hash of a byte slice.
+///
+/// Allocation-free, deterministic, suitable for use as a per-name signal
+/// to be XOR-reduced over all basenames. Not cryptographic; collisions
+/// are acceptable for change detection because the count is checked
+/// alongside the XOR. A pair of (count, xor-hash) collisions on a real
+/// directory is vanishingly unlikely; on mismatch the worst case is a
+/// rebuild, which is safe.
+fn fnv1a_64(input_bytes: &[u8]) -> u64 {
+    let mut hash_state: u64 = FNV1A_64_OFFSET_BASIS;
+    for &byte_value in input_bytes {
+        hash_state ^= byte_value as u64;
+        hash_state = hash_state.wrapping_mul(FNV1A_64_PRIME);
+    }
+    hash_state
 }
 
 // =========================================================================
@@ -1764,14 +1149,7 @@ fn phase1_stream_directory_into_files(
         entries_skipped_non_regular: 0,
     };
     let mut next_record_id: u64 = 0;
-
-    // Per-basename Pearson hashes are XOR-folded lane-by-lane into this
-    // accumulator. Width is governed by `PEARSON_SALT_ARRAY_SIZE`. The
-    // final value becomes `working_header.signal_hash` and lets the
-    // orchestrator detect, on later calls, whether the *set* of files
-    // has changed (order-independent check). The order-sensitive check
-    // is `chrono_sort_hash_to_n`.
-    let mut signal_hash_accumulator: [u8; PEARSON_SALT_ARRAY_SIZE] = [0u8; PEARSON_SALT_ARRAY_SIZE];
+    let mut signal_hash_accumulator: u64 = 0;
 
     for directory_entry_result in directory_iterator {
         // Per-entry I/O errors: skip this entry, continue with the rest.
@@ -1863,24 +1241,7 @@ fn phase1_stream_directory_into_files(
             return Err(ChronoIndexError::BuildIo);
         }
 
-        // Hash this basename with `pearson_hash_salt_array` under the
-        // Role-1 salts, then XOR-fold lane-by-lane into the accumulator.
-        // An error from the Pearson layer would only occur for an empty
-        // basename, which POSIX `readdir` never yields and which the
-        // earlier basename-length check would not let through; we still
-        // handle it terse-erroring rather than panicking, per project
-        // policy.
-        let per_basename_signal_hash = match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            basename_bytes,
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        ) {
-            Ok(bytes) => bytes,
-            Err(_) => return Err(ChronoIndexError::BuildIo),
-        };
-        for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-            signal_hash_accumulator[lane_index] ^= per_basename_signal_hash[lane_index];
-        }
+        signal_hash_accumulator ^= fnv1a_64(basename_bytes);
         next_record_id = next_record_id.saturating_add(1);
         summary.files_indexed = summary.files_indexed.saturating_add(1);
     }
@@ -2392,7 +1753,7 @@ mod chrono_index_part_b_tests {
             .expect("read header ok")
             .expect("header present");
         assert_eq!(header.file_count, 0);
-        assert_eq!(header.signal_hash, [0u8; PEARSON_SALT_ARRAY_SIZE]);
+        assert_eq!(header.signal_hash, 0);
         // last_mtime sentinel preserved
         assert_eq!(header.last_mtime_sec, i64::MIN);
         assert_eq!(header.last_mtime_nsec, 0);
@@ -2429,12 +1790,7 @@ mod chrono_index_part_b_tests {
             .expect("read header ok")
             .expect("header present");
         assert_eq!(header.file_count, 4);
-        // After indexing a non-empty directory, at least one lane of
-        // the XOR-folded Pearson signal_hash should be nonzero with
-        // overwhelming probability. (The all-zero outcome is possible
-        // in principle for adversarially chosen basenames; for the
-        // ordinary test inputs used here it does not occur.)
-        assert_ne!(header.signal_hash, [0u8; PEARSON_SALT_ARRAY_SIZE]);
+        assert_ne!(header.signal_hash, 0);
 
         // Verify mtimes.bin is sorted ascending.
         let mtimes_path = build_index_file_path(&temp_root, MTIMES_FILENAME);
@@ -2586,6 +1942,13 @@ mod chrono_index_part_b_tests {
     }
 
     #[test]
+    fn fnv1a_64_is_deterministic_and_distinguishes_inputs() {
+        assert_eq!(fnv1a_64(b""), fnv1a_64(b""));
+        assert_eq!(fnv1a_64(b"abc"), fnv1a_64(b"abc"));
+        assert_ne!(fnv1a_64(b"abc"), fnv1a_64(b"abd"));
+    }
+
+    #[test]
     fn mtime_record_serialize_round_trip() {
         let original = MtimeRecord {
             mtime_sec: 1_700_000_123,
@@ -2662,11 +2025,7 @@ mod chrono_index_part_b_tests {
     }
 
     #[test]
-    fn cold_build_records_signal_hash_as_xor_of_basename_pearson() {
-        // Project context: after a cold build, `header.signal_hash`
-        // must equal the lane-wise XOR of per-basename Pearson hashes
-        // (Role 1, salts = `SIGNAL_HASH_SALTS`). This test reproduces
-        // that recipe independently and checks the on-disk header.
+    fn cold_build_records_signal_hash_as_xor_of_basename_fnv1a() {
         let temp_root = make_test_temp_root("signal");
         let watched = make_watched_dir_with_files(
             "signal",
@@ -2678,32 +2037,8 @@ mod chrono_index_part_b_tests {
             .expect("read header ok")
             .expect("header present");
 
-        // Hash each basename with the Role-1 recipe.
-        let hash_one = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"one.dat",
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash one");
-        let hash_two = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"two.dat",
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash two");
-        let hash_three = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"three.dat",
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash three");
-
-        // XOR-fold lane by lane.
-        let mut expected_signal = [0u8; PEARSON_SALT_ARRAY_SIZE];
-        for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-            expected_signal[lane_index] =
-                hash_one[lane_index] ^ hash_two[lane_index] ^ hash_three[lane_index];
-        }
+        // Recompute expected XOR independently and compare.
+        let expected_signal = fnv1a_64(b"one.dat") ^ fnv1a_64(b"two.dat") ^ fnv1a_64(b"three.dat");
         assert_eq!(header.signal_hash, expected_signal);
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -2912,25 +2247,18 @@ mod chrono_index_part_b_tests {
 /// in larger bursts; choose smaller if memory is tighter still.
 pub const APPEND_BATCH_RECORDS: usize = 256;
 
-/// Filename of the optional sidecar that stores per-basename Pearson
+/// Filename of the optional sidecar that stores per-basename FNV-1a 64
 /// hashes parallel to `names.bin`. Built lazily on first append. Allows
 /// "is this basename already indexed?" to be answered without rereading
 /// the (heavier) `names.bin`.
 ///
-/// Layout: `record_id -> Pearson hash of basename`, fixed
-/// `NAME_HASH_RECORD_SIZE` (= `PEARSON_SALT_ARRAY_SIZE`) bytes per
+/// Layout: `record_id -> u64 FNV-1a 64 of basename`. Fixed 8 B per
 /// record. Position `i` in this file corresponds to position `i` in
-/// `names.bin`. Hashes are produced by `pearson_hash_salt_array` using
-/// `NAME_HASH_SALTS` over `GENERATED_TABLE`.
+/// `names.bin`.
 pub const NAME_HASHES_FILENAME: &str = "name_hashes.bin";
 
 /// Size in bytes of one `name_hashes.bin` record.
-///
-/// Each record stores one Pearson hash of `PEARSON_SALT_ARRAY_SIZE`
-/// bytes, computed with `NAME_HASH_SALTS` over `GENERATED_TABLE`.
-/// Position `i` in this file corresponds to position `i` in
-/// `names.bin`: record_id -> per-basename Pearson hash.
-pub const NAME_HASH_RECORD_SIZE: usize = PEARSON_SALT_ARRAY_SIZE;
+pub const NAME_HASH_RECORD_SIZE: usize = 8;
 
 // =========================================================================
 // Public summary type
@@ -3038,29 +2366,8 @@ fn ensure_name_hashes_sidecar_consistent(
         match names_reader.read_exact(&mut name_buffer) {
             Ok(()) => {
                 let used_len = basename_used_length(&name_buffer);
-                // Empty basenames cannot occur on POSIX (readdir never
-                // yields them), and the cold-build + append paths both
-                // refuse zero-length names earlier. If we somehow read
-                // an all-NUL name record here (corruption), refuse to
-                // emit a bogus sidecar rather than feeding an empty
-                // slice to pearson_hash_salt_array (which would return
-                // an error).
-                if used_len == 0 {
-                    let _ = std::fs::remove_file(&staging_path);
-                    return Err(ChronoIndexError::AppendIo);
-                }
-                let pearson_hash_bytes = match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-                    &name_buffer[..used_len],
-                    &NAME_HASH_SALTS,
-                    &GENERATED_TABLE,
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        let _ = std::fs::remove_file(&staging_path);
-                        return Err(ChronoIndexError::AppendIo);
-                    }
-                };
-                hash_buffer.copy_from_slice(&pearson_hash_bytes);
+                let h = fnv1a_64(&name_buffer[..used_len]);
+                hash_buffer.copy_from_slice(&h.to_le_bytes());
                 if staging_writer.write_all(&hash_buffer).is_err() {
                     let _ = std::fs::remove_file(&staging_path);
                     return Err(ChronoIndexError::AppendIo);
@@ -3123,18 +2430,18 @@ fn basename_used_length(name_record: &[u8; NAME_RECORD_SIZE]) -> usize {
 }
 
 /// Tests whether `target_basename_hash` is already present anywhere in
-/// `name_hashes.bin`. Streamed linear scan over fixed-size
-/// `NAME_HASH_RECORD_SIZE`-byte records; bounded stack memory, no heap
-/// growth with N.
+/// `name_hashes.bin`. Streamed linear scan over fixed-size 8-byte
+/// records; bounded stack memory, no heap growth with N.
 ///
 /// For very large N this is O(N) per candidate. The append-eligibility
-/// gate in `create_or_update_chrono_index` (XOR-of-new-hashes equals
-/// delta) ensures we only call this for genuinely new candidates, so
-/// in the common case we scan and find no hit only K times where K is
-/// the number of new files in this update — typically very small.
+/// gate in part (d): Update orchestration and chronological lookup
+/// (XOR-of-new-hashes equals delta) ensures we only
+/// call this for genuinely new candidates, so in the common case we
+/// scan and find no hit only K times where K is the number of new
+/// files in this update — typically very small.
 fn name_hash_is_present_in_sidecar(
     temp_root_dir: &Path,
-    target_basename_hash: [u8; PEARSON_SALT_ARRAY_SIZE],
+    target_basename_hash: u64,
 ) -> Result<bool, ChronoIndexError> {
     let hashes_path = build_index_file_path(temp_root_dir, NAME_HASHES_FILENAME);
     let handle = match File::open(&hashes_path) {
@@ -3148,10 +2455,11 @@ fn name_hash_is_present_in_sidecar(
     };
     let mut reader = BufReader::new(handle);
     let mut record_buffer = [0u8; NAME_HASH_RECORD_SIZE];
+    let target_bytes = target_basename_hash.to_le_bytes();
     loop {
         match reader.read_exact(&mut record_buffer) {
             Ok(()) => {
-                if record_buffer == target_basename_hash {
+                if record_buffer == target_bytes {
                     return Ok(true);
                 }
             }
@@ -3165,12 +2473,11 @@ fn name_hash_is_present_in_sidecar(
     }
 }
 
-/// Appends one `NAME_HASH_RECORD_SIZE`-byte Pearson hash record to
-/// `name_hashes.bin`. The caller is responsible for keeping append
-/// order in lockstep with `names.bin`.
+/// Appends one 8-byte hash record to `name_hashes.bin`. The caller is
+/// responsible for keeping append order in lockstep with `names.bin`.
 fn append_name_hash_record(
     temp_root_dir: &Path,
-    new_basename_hash: [u8; PEARSON_SALT_ARRAY_SIZE],
+    new_basename_hash: u64,
 ) -> Result<(), ChronoIndexError> {
     let hashes_path = build_index_file_path(temp_root_dir, NAME_HASHES_FILENAME);
     let mut handle = match OpenOptions::new()
@@ -3181,7 +2488,8 @@ fn append_name_hash_record(
         Ok(h) => h,
         Err(_) => return Err(ChronoIndexError::AppendIo),
     };
-    if handle.write_all(&new_basename_hash).is_err() {
+    let buffer = new_basename_hash.to_le_bytes();
+    if handle.write_all(&buffer).is_err() {
         return Err(ChronoIndexError::AppendIo);
     }
     // Flush+sync is performed by the caller in a single fsync at end of
@@ -3509,14 +2817,7 @@ pub fn incremental_append_new_files(
 
     // Bounded batch buffer. Single allocation per call.
     let mut current_batch: Vec<MtimeRecord> = Vec::with_capacity(APPEND_BATCH_RECORDS);
-
-    // Per-batch XOR-fold of the new files' Role-1 Pearson hashes.
-    // Folded into `working_header.signal_hash` when the batch is
-    // flushed by `flush_batch_and_update_header`. Width and semantics
-    // identical to `signal_hash_accumulator` in
-    // `phase1_stream_directory_into_files`.
-    let mut current_batch_signal_xor: [u8; PEARSON_SALT_ARRAY_SIZE] =
-        [0u8; PEARSON_SALT_ARRAY_SIZE];
+    let mut current_batch_signal_xor: u64 = 0;
 
     let directory_iterator = match std::fs::read_dir(parent_directory_to_index) {
         Ok(it) => it,
@@ -3569,22 +2870,10 @@ pub fn incremental_append_new_files(
             continue;
         }
 
-        // Compute the Role-2 (sidecar) Pearson hash and check the
-        // sidecar to see if this is an already-indexed file. Role 2
-        // uses its own salt array (`NAME_HASH_SALTS`) so its
-        // collision profile is statistically independent of Role 1's
-        // signal_hash. A theoretical hash collision here would cause
-        // a conservative skip (the orchestrator's post-append
-        // signal_hash gate would then trigger a rebuild). No panic.
-        let basename_hash_for_sidecar = match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            basename_bytes,
-            &NAME_HASH_SALTS,
-            &GENERATED_TABLE,
-        ) {
-            Ok(bytes) => bytes,
-            Err(_) => return Err(ChronoIndexError::AppendIo),
-        };
-        match name_hash_is_present_in_sidecar(temp_root_dir, basename_hash_for_sidecar)? {
+        // Compute hash and check the sidecar to see if this is an
+        // already-indexed file.
+        let basename_hash = fnv1a_64(basename_bytes);
+        match name_hash_is_present_in_sidecar(temp_root_dir, basename_hash)? {
             true => {
                 // Known file — nothing to do.
                 continue;
@@ -3661,8 +2950,7 @@ pub fn incremental_append_new_files(
             let _ = write_header_atomic(temp_root_dir, &working_header);
             return Err(write_error);
         }
-        if let Err(write_error) = append_name_hash_record(temp_root_dir, basename_hash_for_sidecar)
-        {
+        if let Err(write_error) = append_name_hash_record(temp_root_dir, basename_hash) {
             let _ = flush_batch_and_update_header(
                 temp_root_dir,
                 &mut current_batch,
@@ -3680,23 +2968,7 @@ pub fn incremental_append_new_files(
             record_id: new_record_id,
         };
         current_batch.push(new_record);
-        // Fold this basename's Role-1 (signal_hash) Pearson hash into
-        // the per-batch accumulator. Note this is a SEPARATE hash from
-        // `basename_hash_for_sidecar` above (different salt array):
-        // sidecar uses `NAME_HASH_SALTS`, signal_hash uses
-        // `SIGNAL_HASH_SALTS`, so the two roles are statistically
-        // independent.
-        let per_basename_signal_hash = match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            basename_bytes,
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        ) {
-            Ok(bytes) => bytes,
-            Err(_) => return Err(ChronoIndexError::AppendIo),
-        };
-        for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-            current_batch_signal_xor[lane_index] ^= per_basename_signal_hash[lane_index];
-        }
+        current_batch_signal_xor ^= basename_hash;
         working_header.file_count = working_header.file_count.saturating_add(1);
 
         if current_batch.len() >= APPEND_BATCH_RECORDS {
@@ -3750,7 +3022,7 @@ fn flush_batch_and_update_header(
     temp_root_dir: &Path,
     current_batch: &mut Vec<MtimeRecord>,
     working_header: &mut ChronoIndexHeader,
-    current_batch_signal_xor: &mut [u8; PEARSON_SALT_ARRAY_SIZE],
+    current_batch_signal_xor: &mut u64,
     summary: &mut AppendSummary,
 ) -> Result<(), ChronoIndexError> {
     if current_batch.is_empty() {
@@ -3806,21 +3078,14 @@ fn flush_batch_and_update_header(
         working_header.last_mtime_nsec = new_last_nsec;
     }
 
-    // Fold the batch's XOR contribution into the header's running
-    // signal_hash, lane by lane. XOR is associative and commutative,
-    // so applying batches in any order produces the same final
-    // header.signal_hash.
-    for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-        working_header.signal_hash[lane_index] ^= current_batch_signal_xor[lane_index];
-    }
+    // Update signal hash and counters.
+    working_header.signal_hash ^= *current_batch_signal_xor;
     summary.files_appended = summary
         .files_appended
         .saturating_add(current_batch.len() as u64);
 
     current_batch.clear();
-    // Reset the per-batch accumulator to all-zero so the next batch
-    // starts from a clean slate.
-    *current_batch_signal_xor = [0u8; PEARSON_SALT_ARRAY_SIZE];
+    *current_batch_signal_xor = 0;
     Ok(())
 }
 
@@ -4012,23 +3277,11 @@ mod chrono_index_part_c_tests {
 
     #[test]
     fn append_signal_hash_xor_accumulates_correctly() {
-        // Project context: incremental append must XOR-fold each new
-        // basename's Role-1 Pearson hash into header.signal_hash. The
-        // final value after a build of one file followed by two
-        // appended files must equal the XOR of all three per-basename
-        // Pearson hashes — verifying that the build and append paths
-        // use the same recipe.
         let temp_root = make_test_temp_root("signal_xor");
         let watched = make_watched_dir_with_files("signal_xor", &[("alpha", b"a")]);
         let _ = cold_build_index(&temp_root, &watched).expect("cold build");
         let header_after_build = read_header(&temp_root).expect("r").expect("p");
-
-        let expected_initial = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"alpha",
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash alpha");
+        let expected_initial = fnv1a_64(b"alpha");
         assert_eq!(header_after_build.signal_hash, expected_initial);
 
         add_file_to_watched_dir(&watched, "beta", b"b");
@@ -4038,31 +3291,7 @@ mod chrono_index_part_c_tests {
             .expect("append ok");
 
         let header_after_append = read_header(&temp_root).expect("r").expect("p");
-
-        let hash_alpha = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"alpha",
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash alpha");
-        let hash_beta = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"beta",
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash beta");
-        let hash_gamma = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"gamma",
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash gamma");
-
-        let mut expected_final = [0u8; PEARSON_SALT_ARRAY_SIZE];
-        for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-            expected_final[lane_index] =
-                hash_alpha[lane_index] ^ hash_beta[lane_index] ^ hash_gamma[lane_index];
-        }
+        let expected_final = fnv1a_64(b"alpha") ^ fnv1a_64(b"beta") ^ fnv1a_64(b"gamma");
         assert_eq!(header_after_append.signal_hash, expected_final);
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -4147,27 +3376,20 @@ mod chrono_index_part_c_tests {
         let meta = std::fs::metadata(&sidecar_path).expect("meta");
         assert_eq!(meta.len() as usize, 3 * NAME_HASH_RECORD_SIZE);
 
-        // Each hash in the sidecar must match the Role-2 Pearson hash
-        // of the corresponding basename. NAME_HASH_RECORD_SIZE equals
-        // PEARSON_SALT_ARRAY_SIZE, so the on-disk record IS the hash
-        // array — no integer decoding step needed.
+        // Each hash in the sidecar must match the corresponding name.
         let mut sidecar_handle = File::open(&sidecar_path).expect("open");
         let mut names_handle =
             File::open(&build_index_file_path(&temp_root, NAMES_FILENAME)).expect("open names");
         for _ in 0..3u64 {
             let mut hash_buf = [0u8; NAME_HASH_RECORD_SIZE];
             sidecar_handle.read_exact(&mut hash_buf).expect("read hash");
+            let stored_hash = u64::from_le_bytes(hash_buf);
             let mut name_buf = [0u8; NAME_RECORD_SIZE];
             names_handle.read_exact(&mut name_buf).expect("read name");
             let used = basename_used_length(&name_buf);
-            let expected_hash = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-                &name_buf[..used],
-                &NAME_HASH_SALTS,
-                &GENERATED_TABLE,
-            )
-            .expect("pearson hash");
-            assert_eq!(hash_buf, expected_hash);
+            assert_eq!(stored_hash, fnv1a_64(&name_buf[..used]));
         }
+
         let _ = std::fs::remove_dir_all(&temp_root);
         let _ = std::fs::remove_dir_all(&watched);
     }
@@ -4327,27 +3549,12 @@ mod chrono_index_part_c_tests {
         let header = read_header(&temp_root).expect("r").expect("p");
         let _ = incremental_append_new_files(&temp_root, &watched, &header).expect("noop append");
 
-        // Lookup an existing basename's Role-2 Pearson hash → must be
-        // present.
-        let present_hash = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"present_one",
-            &NAME_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash present");
+        // Lookup an existing basename hash → must be present.
+        let present_hash = fnv1a_64(b"present_one");
         assert!(name_hash_is_present_in_sidecar(&temp_root, present_hash).expect("lookup ok"));
 
-        // Lookup a Role-2 hash for a basename that does not exist →
-        // must be absent. (A theoretical Pearson hash collision could
-        // produce a false positive, but for these short distinct
-        // basenames at width PEARSON_SALT_ARRAY_SIZE = 2 the collision
-        // probability is ~1/65536 — negligible in this test.)
-        let absent_hash = pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            b"definitely_not_there_xyz",
-            &NAME_HASH_SALTS,
-            &GENERATED_TABLE,
-        )
-        .expect("hash absent");
+        // Lookup a basename that does not exist → must be absent.
+        let absent_hash = fnv1a_64(b"definitely_not_there_xyz");
         assert!(!name_hash_is_present_in_sidecar(&temp_root, absent_hash).expect("lookup ok"));
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -4484,18 +3691,17 @@ pub struct UpdateSummary {
 // Live-directory probe: count + signal hash, no stat()
 // =========================================================================
 
-/// Snapshot of the watched directory's contents at probe time.
+/// Probe result for the live directory: total regular-file count and
+/// XOR-fold of FNV-1a 64 over their basenames. Used to decide between
+/// the no-op / incremental / rebuild paths in `create_or_update_chrono_index`.
 ///
-/// `live_signal_hash` is computed exactly the same way as
-/// `ChronoIndexHeader.signal_hash` — per-basename Pearson hash under
-/// `SIGNAL_HASH_SALTS` over `GENERATED_TABLE`, XOR-folded lane by lane.
-/// The orchestrator in `create_or_update_chrono_index` compares this
-/// directly against the committed header's `signal_hash` to detect
-/// whether the live directory still matches the indexed set.
+/// `entries_skipped_overlong_name`, `entries_skipped_stat_failed`, and
+/// `entries_skipped_non_regular` are tracked here too so the orchestrator
+/// has the same view of "what counts" as the build/append paths do.
 #[derive(Clone, Copy, Debug)]
 struct LiveDirectoryProbe {
     live_file_count: u64,
-    live_signal_hash: [u8; PEARSON_SALT_ARRAY_SIZE],
+    live_signal_hash: u64,
     entries_skipped_overlong_name: u64,
     entries_skipped_stat_failed: u64,
     entries_skipped_non_regular: u64,
@@ -4515,7 +3721,7 @@ fn probe_live_directory(parent_directory: &Path) -> Result<LiveDirectoryProbe, C
 
     let mut probe = LiveDirectoryProbe {
         live_file_count: 0,
-        live_signal_hash: [0u8; PEARSON_SALT_ARRAY_SIZE],
+        live_signal_hash: 0,
         entries_skipped_overlong_name: 0,
         entries_skipped_stat_failed: 0,
         entries_skipped_non_regular: 0,
@@ -4565,25 +3771,7 @@ fn probe_live_directory(parent_directory: &Path) -> Result<LiveDirectoryProbe, C
             continue;
         }
 
-        // Hash the basename with the Role-1 salts and XOR-fold lane by
-        // lane. Identical recipe to the one used in
-        // `phase1_stream_directory_into_files` and
-        // `incremental_append_new_files`, so the probe's
-        // `live_signal_hash` is directly comparable to the committed
-        // `header.signal_hash`. On Pearson error (only possible on an
-        // empty basename, which cannot occur here), surface a terse
-        // error code rather than panic.
-        let per_basename_signal_hash = match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-            basename_bytes,
-            &SIGNAL_HASH_SALTS,
-            &GENERATED_TABLE,
-        ) {
-            Ok(bytes) => bytes,
-            Err(_) => return Err(ChronoIndexError::BuildIo),
-        };
-        for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-            probe.live_signal_hash[lane_index] ^= per_basename_signal_hash[lane_index];
-        }
+        probe.live_signal_hash ^= fnv1a_64(basename_bytes);
         probe.live_file_count = probe.live_file_count.saturating_add(1);
     }
 
@@ -5487,80 +4675,55 @@ mod chrono_index_lookup_tests {
 // hundreds (the chess-game use case), collision probability under
 // random file reorderings is negligible (≈ 2^-64 per comparison).
 
-/// Computes an order-sensitive Pearson-based hash over the
+/// Computes an order-sensitive FNV-1a 64-bit hash over the
 /// chronologically sorted sequence of `(mtime_sec, mtime_nsec, basename)`
 /// tuples at positions `0` through `up_to_position` inclusive in the
 /// committed index.
 ///
 /// ## Project context
 ///
-/// This is the measurement tool for Plan-B change detection (see
-/// module docs for Part g). The caller stores the returned hash after
-/// building game state; on each subsequent poll it calls
+/// This is the measurement tool for Plan-B change detection (see module
+/// docs for Part g). The caller stores the returned hash after building
+/// game state; on each subsequent poll it calls
 /// [`check_chronosort_hash_to_n`] to test whether the past sequence
 /// is still intact before deciding to rebuild.
 ///
-/// Unlike `header.signal_hash` (which is XOR-folded and therefore
-/// order-independent), this hash changes if any file slides to a
-/// different chronological position, even if the set of files is
-/// unchanged. That is the property required to detect the
-/// "delayed-thread mtime retrograde" edge case.
-///
-/// ## Algorithm
-///
-/// The hash is computed with `PEARSON_SALT_ARRAY_SIZE` parallel
-/// Pearson chains over the byte stream
-///
-/// ```text
-///     for each position p in 0..=up_to_position:
-///         mtime_sec_LE_bytes   (8)
-///         mtime_nsec_LE_bytes  (4)
-///         basename_bytes       (variable, no NUL padding)
-///         0xFF                 (1, separator)
-/// ```
-///
-/// fed through the same `GENERATED_TABLE` used by every other Pearson
-/// hash in this module. Each lane `i` is initialized to
-/// `CHRONO_SORT_HASH_SALTS[i]` so all lanes diverge from byte one.
-/// Per-byte step for each lane `i`:
-///
-/// ```text
-///     state[i] = GENERATED_TABLE[state[i] ^ input_byte]
-/// ```
-///
-/// The 0xFF separator after each record prevents prefix-extension
-/// ambiguities (e.g. hash(["ab","c"]) vs. hash(["a","bc"])).
+/// Unlike `header.signal_hash` (which is XOR-based and order-independent),
+/// this hash changes if any file slides to a different chronological
+/// position, even if the set of files is unchanged. That is the
+/// property required to detect the "delayed-thread mtime retrograde"
+/// edge case.
 ///
 /// ## Arguments
 ///
-/// - `temp_root_dir`: the index temp root.
+/// - `temp_root_dir`: the index temp root — same path passed to
+///   [`create_or_update_chrono_index`].
 /// - `up_to_position`: the last (inclusive) chronological position to
-///   include. Must be `< header.file_count`. Out-of-range or
-///   missing-index → `Err(LookupIo)`.
+///   include. Must be `< header.file_count`. If `file_count == 0` or
+///   `up_to_position >= file_count`, returns `Err(LookupIo)`.
 ///
 /// ## Returns
 ///
-/// - `Ok([u8; PEARSON_SALT_ARRAY_SIZE])` — deterministic Pearson hash
-///   of the ordered sequence. Identical committed-index state +
-///   identical `up_to_position` always returns the same value.
+/// - `Ok(hash_value)` — a deterministic u64 fingerprint of the ordered
+///   sequence. Identical committed-index state + identical
+///   `up_to_position` always returns the same value.
 /// - `Err(LookupIo)` — on any I/O failure or out-of-range position.
-///   Callers should treat this as "unknown change: rebuild
-///   defensively."
+///   Callers should treat this as "unknown change: rebuild defensively."
 ///
 /// ## Memory
 ///
-/// Stack only. Two fixed-size reused buffers per record (20 B + 64 B)
-/// and a `[u8; PEARSON_SALT_ARRAY_SIZE]` accumulator. O(1) memory,
-/// independent of directory size.
+/// Stack only. No heap allocation. Two fixed-size buffers reused per
+/// record (20 B + 64 B). One u64 accumulator. O(1) memory, independent
+/// of directory size.
 ///
 /// Per project policy: never panics, never halts.
 pub fn chrono_sort_hash_to_n(
     temp_root_dir: &Path,
     up_to_position: u64,
-) -> Result<[u8; PEARSON_SALT_ARRAY_SIZE], ChronoIndexError> {
-    // Read and validate the committed header. No header means the
-    // index has never been built; treat as an I/O-level failure so the
-    // caller knows it cannot rely on the hash.
+) -> Result<u64, ChronoIndexError> {
+    // Read and validate the committed header. No header means the index
+    // has never been built; treat as an I/O-level failure so the caller
+    // knows it cannot rely on the hash.
     let committed_header = match read_header(temp_root_dir)? {
         Some(h) => h,
         None => return Err(ChronoIndexError::LookupIo),
@@ -5590,15 +4753,15 @@ pub fn chrono_sort_hash_to_n(
     let mut mtime_record_bytes = [0u8; MTIME_RECORD_SIZE];
     let mut name_record_bytes = [0u8; NAME_RECORD_SIZE];
 
-    // `PEARSON_SALT_ARRAY_SIZE` parallel Pearson chains. Each lane
-    // starts from its salt byte so the lanes diverge immediately and
-    // produce statistically independent output bytes.
-    let mut lane_states: [u8; PEARSON_SALT_ARRAY_SIZE] = CHRONO_SORT_HASH_SALTS;
+    // Running FNV-1a 64 accumulator. Starting from the standard offset
+    // basis ensures the empty-sequence case (prevented above) is
+    // distinguishable from any single-record sequence.
+    let mut running_hash: u64 = FNV1A_64_OFFSET_BASIS;
 
     // Separator byte fed after each record's payload to prevent
-    // prefix-extension hash collisions (e.g. without a separator,
-    // hash(["ab", "c"]) could equal hash(["a", "bc"]) for certain
-    // byte sequences).
+    // prefix-extension hash collisions.
+    // E.g. without a separator, hash(["ab", "c"]) could equal
+    // hash(["a", "bc"]) for certain byte sequences.
     const RECORD_SEPARATOR_BYTE: u8 = 0xFF;
 
     // Number of chronological positions to include: 0..=up_to_position.
@@ -5608,9 +4771,8 @@ pub fn chrono_sort_hash_to_n(
 
     // mtimes.bin is read sequentially from offset 0; a single open +
     // sequential read suffices (no per-record seek on the mtime side).
-    // names.bin requires random-access seeks (record_id is the
-    // mtime-sort order's back-reference into the insertion-order name
-    // store).
+    // names.bin requires random-access seeks (record_id is the mtime-sort
+    // order's back-reference into the insertion-order name store).
     while positions_processed < record_count_to_hash {
         // Read the next mtime record in chronological order.
         match mtimes_handle.read_exact(&mut mtime_record_bytes) {
@@ -5645,69 +4807,58 @@ pub fn chrono_sort_hash_to_n(
         let basename_used_len = basename_used_length(&name_record_bytes);
         let basename_bytes = &name_record_bytes[..basename_used_len];
 
-        // Feed bytes into the parallel Pearson chains in this order:
+        // Feed bytes into the FNV-1a 64 accumulator in this order:
         //   mtime_sec  (8 bytes, LE) — captures WHEN the file was last modified
         //   mtime_nsec (4 bytes, LE) — sub-second resolution tiebreaker
         //   basename   (variable)    — captures WHICH file is at this position
         //   0xFF separator           — prevents prefix-extension ambiguity
         //
-        // The order of these four sub-streams is deterministic and
-        // identical across runs, so the resulting hash is reproducible.
+        // Together these make the hash sensitive to both identity and
+        // ordering of files at each position.
         for byte_value in mtime_record.mtime_sec.to_le_bytes() {
-            for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-                let table_index: usize = (lane_states[lane_index] ^ byte_value) as usize;
-                lane_states[lane_index] = GENERATED_TABLE[table_index];
-            }
+            running_hash ^= byte_value as u64;
+            running_hash = running_hash.wrapping_mul(FNV1A_64_PRIME);
         }
         for byte_value in mtime_record.mtime_nsec.to_le_bytes() {
-            for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-                let table_index: usize = (lane_states[lane_index] ^ byte_value) as usize;
-                lane_states[lane_index] = GENERATED_TABLE[table_index];
-            }
+            running_hash ^= byte_value as u64;
+            running_hash = running_hash.wrapping_mul(FNV1A_64_PRIME);
         }
         for &byte_value in basename_bytes {
-            for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-                let table_index: usize = (lane_states[lane_index] ^ byte_value) as usize;
-                lane_states[lane_index] = GENERATED_TABLE[table_index];
-            }
+            running_hash ^= byte_value as u64;
+            running_hash = running_hash.wrapping_mul(FNV1A_64_PRIME);
         }
-        for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-            let table_index: usize = (lane_states[lane_index] ^ RECORD_SEPARATOR_BYTE) as usize;
-            lane_states[lane_index] = GENERATED_TABLE[table_index];
-        }
+        running_hash ^= RECORD_SEPARATOR_BYTE as u64;
+        running_hash = running_hash.wrapping_mul(FNV1A_64_PRIME);
 
         positions_processed = positions_processed.saturating_add(1);
     }
 
     // Defensive post-loop check: if the loop exited with fewer
-    // iterations than expected (which should not occur given the
-    // bounds validated above, but physical I/O can produce unexpected
-    // results), surface a terse error rather than returning a partial
-    // hash silently.
+    // iterations than expected (which should not occur given the bounds
+    // validated above, but physical I/O can produce unexpected results),
+    // surface a terse error rather than returning a partial hash silently.
     if positions_processed != record_count_to_hash {
         return Err(ChronoIndexError::LookupIo);
     }
 
-    Ok(lane_states)
+    Ok(running_hash)
 }
 
 /// Tests whether the chronologically sorted sequence of files at
-/// positions `0` through `up_to_position` (inclusive) in the
-/// committed index is identical to the sequence that produced
-/// `previous_hash`.
+/// positions `0` through `up_to_position` (inclusive) in the committed
+/// index is identical to the sequence that produced `previous_hash`.
 ///
 /// ## Project context
 ///
-/// This is the polling function for Plan-B change detection (see
-/// module docs for Part g). It is the cheap per-tick check that
-/// replaces constant full-state rebuilds. In the chess-game use case:
+/// This is the polling function for Plan-B change detection (see module
+/// docs for Part g). It is the cheap per-tick check that replaces
+/// constant full-state rebuilds. In the chess-game use case:
 ///
 ///   - Most of the time `check_chronosort_hash_to_n` returns `Ok(true)`
 ///     and the engine can proceed without rebuilding.
 ///   - On the rare occasion that a delayed thread's file retroactively
-///     shifts the chronological order of committed positions, it
-///     returns `Ok(false)` and the engine discards and rebuilds its
-///     state.
+///     shifts the chronological order of committed positions, it returns
+///     `Ok(false)` and the engine discards and rebuilds its state.
 ///
 /// The cost is proportional to `up_to_position + 1` fixed-size disk
 /// reads — much cheaper than re-reading every watched file on every
@@ -5715,7 +4866,8 @@ pub fn chrono_sort_hash_to_n(
 ///
 /// ## Arguments
 ///
-/// - `temp_root_dir`: the index temp root.
+/// - `temp_root_dir`: the index temp root — same path passed to
+///   [`create_or_update_chrono_index`].
 /// - `up_to_position`: the last (inclusive) chronological position to
 ///   include. Must be `< header.file_count`.
 /// - `previous_hash`: the value previously returned by
@@ -5725,17 +4877,22 @@ pub fn chrono_sort_hash_to_n(
 /// ## Returns
 ///
 /// - `Ok(true)` — the sequence at positions `0..=up_to_position` is
-///   unchanged from when `previous_hash` was computed.
-/// - `Ok(false)` — the sequence has changed; the caller should
-///   discard state and rebuild.
-/// - `Err(LookupIo)` — the hash could not be computed; treat as
-///   unknown-change and rebuild defensively.
+///   unchanged from when `previous_hash` was computed. No rebuild is
+///   needed based on this check alone.
+/// - `Ok(false)` — the sequence has changed (a file moved to a
+///   different chronological position, or a different file now occupies
+///   a position). The caller should discard state and rebuild from
+///   position 0.
+/// - `Err(LookupIo)` — the hash could not be computed (e.g.,
+///   `up_to_position >= file_count`, index not yet built, or I/O
+///   failure). The caller should treat this as an unknown-change
+///   condition and rebuild defensively.
 ///
 /// Per project policy: never panics, never halts.
 pub fn check_chronosort_hash_to_n(
     temp_root_dir: &Path,
     up_to_position: u64,
-    previous_hash: [u8; PEARSON_SALT_ARRAY_SIZE],
+    previous_hash: u64,
 ) -> Result<bool, ChronoIndexError> {
     let current_hash = chrono_sort_hash_to_n(temp_root_dir, up_to_position)?;
     Ok(current_hash == previous_hash)
@@ -6066,12 +5223,10 @@ mod chrono_index_part_g_tests {
         let watched = make_watched_dir_with_files("check_false", &[("a", b"1"), ("b", b"2")]);
         let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
-        // Compute the real hash, then construct a deliberately wrong
-        // value as the "previous" hash by toggling one lane. Any
-        // single-byte change is enough to make the comparison Ok(false).
+        // Compute the real hash, then pass a deliberately wrong value
+        // as the "previous" hash.
         let real_hash = chrono_sort_hash_to_n(&temp_root, 1).expect("hash ok");
-        let mut wrong_hash = real_hash;
-        wrong_hash[0] = wrong_hash[0].wrapping_add(1);
+        let wrong_hash = real_hash.wrapping_add(1);
 
         let changed = check_chronosort_hash_to_n(&temp_root, 1, wrong_hash).expect("check ok");
         assert!(!changed, "mismatched previous_hash must yield Ok(false)");
@@ -6114,11 +5269,7 @@ mod chrono_index_part_g_tests {
         let watched = make_watched_dir_with_files("check_oob", &[("sole", b"x")]);
         let _ = create_or_update_chrono_index(&temp_root, &watched).expect("build");
 
-        // The exact "previous_hash" value does not matter — the
-        // function must return Err on the bad position before it ever
-        // compares the hash. Use any constant array of the right type.
-        let placeholder_hash: [u8; PEARSON_SALT_ARRAY_SIZE] = [0xDEu8; PEARSON_SALT_ARRAY_SIZE];
-        let result = check_chronosort_hash_to_n(&temp_root, 5, placeholder_hash);
+        let result = check_chronosort_hash_to_n(&temp_root, 5, 0xDEAD);
         assert_eq!(result.err(), Some(ChronoIndexError::LookupIo));
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -6178,7 +5329,7 @@ mod chrono_index_part_g_tests {
             Some(ChronoIndexError::LookupIo)
         );
         assert_eq!(
-            check_chronosort_hash_to_n(&temp_root, 0, [0u8; PEARSON_SALT_ARRAY_SIZE],).err(),
+            check_chronosort_hash_to_n(&temp_root, 0, 0).err(),
             Some(ChronoIndexError::LookupIo)
         );
         let _ = std::fs::remove_dir_all(&temp_root);
