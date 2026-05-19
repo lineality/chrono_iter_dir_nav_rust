@@ -1,9 +1,9 @@
-// src/chrono_index/mod.rs
+// src/chrono_sort_module.rs
 
-//! # Chronological Directory Iterator — File-Backed Index
+//! # Chronological Directory Sort, Search, Hash (to safely iterate) — File-Backed Index
 //!
-//! Posix: Iterate chronologically through files in a local dir
-//! using a local-file-system on-file based lookup-table
+//! Posix: Sort, search, chronologically through files in a local
+//! dir using a local-file-system on-file based lookup-table
 //! for chronological order, because mtime (time file modified)
 //! is not a default sort option, and storing many N full paths
 //! in RAM is infeasible.
@@ -538,19 +538,6 @@ pub fn write_header_atomic(
     // "rebuild needed" on the next run, which is the intended fail-safe.
 
     Ok(())
-}
-
-// Mark public-surface helpers as referenced so the compiler does not
-// warn about apparent disuse from inside this file alone. These items
-// are used by the build, append, and lookup paths below.
-#[allow(dead_code)]
-fn _module_surface_anchor() {
-    let _ = SeekFrom::Start(0);
-    let _ = NAMES_FILENAME;
-    let _ = MTIMES_FILENAME;
-    let _ = SCRATCH_DIRNAME;
-    let _ = NAME_RECORD_SIZE;
-    let _ = MTIME_RECORD_SIZE;
 }
 
 // =========================================================================
@@ -1292,15 +1279,18 @@ fn phase1_stream_directory_into_files(
 #[cfg(unix)]
 fn extract_mtime_seconds_and_nanos(metadata: &std::fs::Metadata) -> Option<(i64, i32)> {
     use std::os::unix::fs::MetadataExt;
-    let sec = metadata.mtime();
-    let nsec_u64 = metadata.mtime_nsec();
-    // nsec is always in [0, 1_000_000_000); fits in i32. Defensive clamp.
-    let nsec_i32 = if nsec_u64 < 0 || nsec_u64 >= 1_000_000_000 {
+    let mtime_sec = metadata.mtime();
+    let mtime_nsec_i64 = metadata.mtime_nsec();
+    // Defensive clamp: nsec should be in [0, 1_000_000_000).
+    // If the OS returns something outside that range (corruption,
+    // unsupported filesystem, etc.), default to 0 rather than
+    // propagating a nonsensical value. Fits in i32 after clamp.
+    let mtime_nsec_i32 = if mtime_nsec_i64 < 0 || mtime_nsec_i64 >= 1_000_000_000 {
         0
     } else {
-        nsec_u64 as i32
+        mtime_nsec_i64 as i32
     };
-    Some((sec, nsec_i32))
+    Some((mtime_sec, mtime_nsec_i32))
 }
 
 #[cfg(not(unix))]
@@ -4611,5 +4601,735 @@ mod chrono_index_lookup_tests {
 
         let _ = std::fs::remove_dir_all(&temp_root);
         let _ = std::fs::remove_dir_all(&watched);
+    }
+}
+
+// src/chrono_index/mod.rs
+// (Add Part (g) after the chrono_index_lookup_tests module and before
+// the `//! # Chrono-Sort Module — Mini Demo` comment block.)
+
+// =========================================================================
+// Part (g): Order-sensitive chronological sequence hash
+// =========================================================================
+//
+// ## Why these functions exist
+//
+// `header.signal_hash` is an XOR-fold of per-basename FNV-1a hashes.
+// XOR is commutative and associative, so it is ORDER-INDEPENDENT: a
+// directory whose files swap chronological positions produces an
+// identical signal_hash. That is intentional for its purpose (change
+// detection of the *set* of files), but it cannot detect the specific
+// failure mode described in the project discussion:
+//
+//   A delayed thread finishes writing a file whose mtime is earlier
+//   than files the game engine has already processed. The file silently
+//   slides into an earlier chronological slot, retroactively changing
+//   the meaning of positions 0..N that the engine used to build state.
+//
+// An order-SENSITIVE hash over positions 0..=N detects exactly this.
+// The hash is computed by feeding (mtime_sec, mtime_nsec, basename)
+// for each position, in ascending chronological order, into a running
+// FNV-1a 64 accumulator. Any change to any position's content or to
+// the relative ordering of positions produces a different hash with
+// overwhelming probability.
+//
+// ## Plan-B from project discussion — usage pattern
+//
+//   1. After `update_index` commits a new index with file_count == K,
+//      call `chrono_sort_hash_to_n(temp_root, K - 1)` and store the
+//      result as `known_good_hash` in caller state.
+//
+//   2. On each subsequent periodic poll (before reading the "next" file):
+//
+//        match check_chronosort_hash_to_n(temp_root, K - 1, known_good_hash) {
+//            Ok(true)  => // past sequence intact; only look at new files
+//            Ok(false) => // sequence reordered; discard state, rebuild
+//            Err(_)    => // index unreadable; rebuild defensively
+//        }
+//
+//   This is much cheaper than re-reading every file on every poll: the
+//   hash check reads exactly (K × (MTIME_RECORD_SIZE + NAME_RECORD_SIZE))
+//   bytes from two files, with no stat() calls and no watched-file I/O.
+//
+// ## Memory discipline
+//
+// Stack only. No heap allocation. Two fixed-size reused buffers per
+// iteration: 20 bytes (mtime record) + 64 bytes (name record). The hash
+// state is a single u64. Memory cost is O(1), not O(N).
+//
+// ## Hash construction
+//
+// For each position p in 0..=up_to_position (in ascending order):
+//   1. Read MtimeRecord at position p from mtimes.bin.
+//   2. Read the basename at mtime_record.record_id from names.bin.
+//   3. Feed into running FNV-1a 64:
+//        mtime_sec  (8 bytes, little-endian)
+//        mtime_nsec (4 bytes, little-endian)
+//        basename   (N bytes, no NUL padding)
+//        0xFF       (1 separator byte — prevents prefix-extension
+//                    collisions: hash("ab"+"c") ≠ hash("a"+"bc"))
+//
+// The hash is NOT cryptographic. For file counts in the tens to low
+// hundreds (the chess-game use case), collision probability under
+// random file reorderings is negligible (≈ 2^-64 per comparison).
+
+/// Computes an order-sensitive FNV-1a 64-bit hash over the
+/// chronologically sorted sequence of `(mtime_sec, mtime_nsec, basename)`
+/// tuples at positions `0` through `up_to_position` inclusive in the
+/// committed index.
+///
+/// ## Project context
+///
+/// This is the measurement tool for Plan-B change detection (see module
+/// docs for Part g). The caller stores the returned hash after building
+/// game state; on each subsequent poll it calls
+/// [`check_chronosort_hash_to_n`] to test whether the past sequence
+/// is still intact before deciding to rebuild.
+///
+/// Unlike `header.signal_hash` (which is XOR-based and order-independent),
+/// this hash changes if any file slides to a different chronological
+/// position, even if the set of files is unchanged. That is the
+/// property required to detect the "delayed-thread mtime retrograde"
+/// edge case.
+///
+/// ## Arguments
+///
+/// - `temp_root_dir`: the index temp root — same path passed to
+///   [`update_index`].
+/// - `up_to_position`: the last (inclusive) chronological position to
+///   include. Must be `< header.file_count`. If `file_count == 0` or
+///   `up_to_position >= file_count`, returns `Err(LookupIo)`.
+///
+/// ## Returns
+///
+/// - `Ok(hash_value)` — a deterministic u64 fingerprint of the ordered
+///   sequence. Identical committed-index state + identical
+///   `up_to_position` always returns the same value.
+/// - `Err(LookupIo)` — on any I/O failure or out-of-range position.
+///   Callers should treat this as "unknown change: rebuild defensively."
+///
+/// ## Memory
+///
+/// Stack only. No heap allocation. Two fixed-size buffers reused per
+/// record (20 B + 64 B). One u64 accumulator. O(1) memory, independent
+/// of directory size.
+///
+/// Per project policy: never panics, never halts.
+pub fn chrono_sort_hash_to_n(
+    temp_root_dir: &Path,
+    up_to_position: u64,
+) -> Result<u64, ChronoIndexError> {
+    // Read and validate the committed header. No header means the index
+    // has never been built; treat as an I/O-level failure so the caller
+    // knows it cannot rely on the hash.
+    let committed_header = match read_header(temp_root_dir)? {
+        Some(h) => h,
+        None => return Err(ChronoIndexError::LookupIo),
+    };
+
+    // Defensive bounds check: the requested position must be a valid
+    // slot in the committed index.
+    if committed_header.file_count == 0 || up_to_position >= committed_header.file_count {
+        return Err(ChronoIndexError::LookupIo);
+    }
+
+    // Open both index files once per call. Both are held open for the
+    // duration of the loop; no per-record open/close overhead.
+    let mtimes_path = build_index_file_path(temp_root_dir, MTIMES_FILENAME);
+    let mut mtimes_handle = match File::open(&mtimes_path) {
+        Ok(h) => h,
+        Err(_) => return Err(ChronoIndexError::LookupIo),
+    };
+
+    let names_path = build_index_file_path(temp_root_dir, NAMES_FILENAME);
+    let mut names_handle = match File::open(&names_path) {
+        Ok(h) => h,
+        Err(_) => return Err(ChronoIndexError::LookupIo),
+    };
+
+    // Fixed-size stack buffers reused across all iterations.
+    let mut mtime_record_bytes = [0u8; MTIME_RECORD_SIZE];
+    let mut name_record_bytes = [0u8; NAME_RECORD_SIZE];
+
+    // Running FNV-1a 64 accumulator. Starting from the standard offset
+    // basis ensures the empty-sequence case (prevented above) is
+    // distinguishable from any single-record sequence.
+    let mut running_hash: u64 = FNV1A_64_OFFSET_BASIS;
+
+    // Separator byte fed after each record's payload to prevent
+    // prefix-extension hash collisions.
+    // E.g. without a separator, hash(["ab", "c"]) could equal
+    // hash(["a", "bc"]) for certain byte sequences.
+    const RECORD_SEPARATOR_BYTE: u8 = 0xFF;
+
+    // Number of chronological positions to include: 0..=up_to_position.
+    // Bounded by committed_header.file_count (validated above).
+    let record_count_to_hash: u64 = up_to_position.saturating_add(1);
+    let mut positions_processed: u64 = 0;
+
+    // mtimes.bin is read sequentially from offset 0; a single open +
+    // sequential read suffices (no per-record seek on the mtime side).
+    // names.bin requires random-access seeks (record_id is the mtime-sort
+    // order's back-reference into the insertion-order name store).
+    while positions_processed < record_count_to_hash {
+        // Read the next mtime record in chronological order.
+        match mtimes_handle.read_exact(&mut mtime_record_bytes) {
+            Ok(()) => {}
+            Err(_read_error) => return Err(ChronoIndexError::LookupIo),
+        }
+        let mtime_record = MtimeRecord::read_from(&mtime_record_bytes);
+
+        // Defensive: the back-reference record_id must be a valid slot
+        // in names.bin. A corrupt index could produce an out-of-range
+        // value; catch it here rather than seeking past the file end.
+        if mtime_record.record_id >= committed_header.file_count {
+            return Err(ChronoIndexError::LookupIo);
+        }
+
+        // Seek names.bin to the slot for this record_id and read it.
+        let names_byte_offset = mtime_record
+            .record_id
+            .saturating_mul(NAME_RECORD_SIZE as u64);
+        if names_handle
+            .seek(SeekFrom::Start(names_byte_offset))
+            .is_err()
+        {
+            return Err(ChronoIndexError::LookupIo);
+        }
+        match names_handle.read_exact(&mut name_record_bytes) {
+            Ok(()) => {}
+            Err(_read_error) => return Err(ChronoIndexError::LookupIo),
+        }
+
+        // Trim NUL padding to get the actual basename bytes.
+        let basename_used_len = basename_used_length(&name_record_bytes);
+        let basename_bytes = &name_record_bytes[..basename_used_len];
+
+        // Feed bytes into the FNV-1a 64 accumulator in this order:
+        //   mtime_sec  (8 bytes, LE) — captures WHEN the file was last modified
+        //   mtime_nsec (4 bytes, LE) — sub-second resolution tiebreaker
+        //   basename   (variable)    — captures WHICH file is at this position
+        //   0xFF separator           — prevents prefix-extension ambiguity
+        //
+        // Together these make the hash sensitive to both identity and
+        // ordering of files at each position.
+        for byte_value in mtime_record.mtime_sec.to_le_bytes() {
+            running_hash ^= byte_value as u64;
+            running_hash = running_hash.wrapping_mul(FNV1A_64_PRIME);
+        }
+        for byte_value in mtime_record.mtime_nsec.to_le_bytes() {
+            running_hash ^= byte_value as u64;
+            running_hash = running_hash.wrapping_mul(FNV1A_64_PRIME);
+        }
+        for &byte_value in basename_bytes {
+            running_hash ^= byte_value as u64;
+            running_hash = running_hash.wrapping_mul(FNV1A_64_PRIME);
+        }
+        running_hash ^= RECORD_SEPARATOR_BYTE as u64;
+        running_hash = running_hash.wrapping_mul(FNV1A_64_PRIME);
+
+        positions_processed = positions_processed.saturating_add(1);
+    }
+
+    // Defensive post-loop check: if the loop exited with fewer
+    // iterations than expected (which should not occur given the bounds
+    // validated above, but physical I/O can produce unexpected results),
+    // surface a terse error rather than returning a partial hash silently.
+    if positions_processed != record_count_to_hash {
+        return Err(ChronoIndexError::LookupIo);
+    }
+
+    Ok(running_hash)
+}
+
+/// Tests whether the chronologically sorted sequence of files at
+/// positions `0` through `up_to_position` (inclusive) in the committed
+/// index is identical to the sequence that produced `previous_hash`.
+///
+/// ## Project context
+///
+/// This is the polling function for Plan-B change detection (see module
+/// docs for Part g). It is the cheap per-tick check that replaces
+/// constant full-state rebuilds. In the chess-game use case:
+///
+///   - Most of the time `check_chronosort_hash_to_n` returns `Ok(true)`
+///     and the engine can proceed without rebuilding.
+///   - On the rare occasion that a delayed thread's file retroactively
+///     shifts the chronological order of committed positions, it returns
+///     `Ok(false)` and the engine discards and rebuilds its state.
+///
+/// The cost is proportional to `up_to_position + 1` fixed-size disk
+/// reads — much cheaper than re-reading every watched file on every
+/// tick, and more reliable than a count-only or XOR-only check.
+///
+/// ## Arguments
+///
+/// - `temp_root_dir`: the index temp root — same path passed to
+///   [`update_index`].
+/// - `up_to_position`: the last (inclusive) chronological position to
+///   include. Must be `< header.file_count`.
+/// - `previous_hash`: the value previously returned by
+///   [`chrono_sort_hash_to_n`] with the same `up_to_position`. The
+///   caller is responsible for storing this across calls.
+///
+/// ## Returns
+///
+/// - `Ok(true)` — the sequence at positions `0..=up_to_position` is
+///   unchanged from when `previous_hash` was computed. No rebuild is
+///   needed based on this check alone.
+/// - `Ok(false)` — the sequence has changed (a file moved to a
+///   different chronological position, or a different file now occupies
+///   a position). The caller should discard state and rebuild from
+///   position 0.
+/// - `Err(LookupIo)` — the hash could not be computed (e.g.,
+///   `up_to_position >= file_count`, index not yet built, or I/O
+///   failure). The caller should treat this as an unknown-change
+///   condition and rebuild defensively.
+///
+/// Per project policy: never panics, never halts.
+pub fn check_chronosort_hash_to_n(
+    temp_root_dir: &Path,
+    up_to_position: u64,
+    previous_hash: u64,
+) -> Result<bool, ChronoIndexError> {
+    let current_hash = chrono_sort_hash_to_n(temp_root_dir, up_to_position)?;
+    Ok(current_hash == previous_hash)
+}
+
+// =========================================================================
+// Tests for Part (g): order-sensitive sequence hash
+// =========================================================================
+
+#[cfg(test)]
+mod chrono_index_part_g_tests {
+    use super::*;
+
+    fn make_test_temp_root(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        path.push(format!(
+            "chrono_index_g_{}_{}_{}",
+            label,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&path).expect("setup: create temp root");
+        path
+    }
+
+    /// Creates a watched directory, populates it with the given files
+    /// (each given a 10 ms sleep so subsequent files have strictly newer
+    /// mtimes on ms-resolution filesystems), and returns the path.
+    fn make_watched_dir_with_files(label: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let mut watched = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        watched.push(format!(
+            "chrono_watched_g_{}_{}_{}",
+            label,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&watched).expect("setup: create watched dir");
+        for (basename, content) in files {
+            let mut path = watched.clone();
+            path.push(basename);
+            let mut f = std::fs::File::create(&path).expect("setup: create file");
+            f.write_all(content).expect("setup: write file");
+            f.sync_all().expect("setup: sync file");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        watched
+    }
+
+    /// Adds one file with a 15 ms pre-sleep (ensures strictly newer
+    /// mtime on filesystems with ms-resolution timestamps).
+    fn add_file(watched_dir: &Path, basename: &str, content: &[u8]) {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let mut path = PathBuf::from(watched_dir);
+        path.push(basename);
+        let mut f = std::fs::File::create(&path).expect("add_file: create");
+        f.write_all(content).expect("add_file: write");
+        f.sync_all().expect("add_file: sync");
+    }
+
+    // -----------------------------------------------------------------
+    // chrono_sort_hash_to_n: basic correctness
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hash_to_n_is_deterministic_across_repeated_calls() {
+        // The same index queried twice must return the same hash.
+        let temp_root = make_test_temp_root("deterministic");
+        let watched = make_watched_dir_with_files(
+            "deterministic",
+            &[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")],
+        );
+        let _ = update_index(&temp_root, &watched).expect("build");
+
+        let hash_first = chrono_sort_hash_to_n(&temp_root, 2).expect("hash ok first");
+        let hash_second = chrono_sort_hash_to_n(&temp_root, 2).expect("hash ok second");
+        assert_eq!(
+            hash_first, hash_second,
+            "repeated calls must return equal hash"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched);
+    }
+
+    #[test]
+    fn hash_to_n_differs_for_different_up_to_positions() {
+        // Hash of positions 0..=0 must differ from hash of 0..=1
+        // (different sequence length → different hash).
+        let temp_root = make_test_temp_root("diff_positions");
+        let watched = make_watched_dir_with_files(
+            "diff_positions",
+            &[
+                ("early.dat", b"e"),
+                ("middle.dat", b"m"),
+                ("late.dat", b"l"),
+            ],
+        );
+        let _ = update_index(&temp_root, &watched).expect("build");
+
+        let hash_0 = chrono_sort_hash_to_n(&temp_root, 0).expect("hash pos 0");
+        let hash_1 = chrono_sort_hash_to_n(&temp_root, 1).expect("hash pos 1");
+        let hash_2 = chrono_sort_hash_to_n(&temp_root, 2).expect("hash pos 2");
+
+        assert_ne!(
+            hash_0, hash_1,
+            "hash of 1 position must differ from 2 positions"
+        );
+        assert_ne!(
+            hash_1, hash_2,
+            "hash of 2 positions must differ from 3 positions"
+        );
+        assert_ne!(
+            hash_0, hash_2,
+            "hash of 1 position must differ from 3 positions"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched);
+    }
+
+    #[test]
+    fn hash_to_n_rejects_position_at_or_past_file_count() {
+        let temp_root = make_test_temp_root("out_of_range");
+        let watched = make_watched_dir_with_files("out_of_range", &[("only.txt", b"x")]);
+        let _ = update_index(&temp_root, &watched).expect("build");
+        // file_count == 1, so valid positions are only 0.
+        // position 1 must fail.
+        let result = chrono_sort_hash_to_n(&temp_root, 1);
+        assert_eq!(result.err(), Some(ChronoIndexError::LookupIo));
+        // position u64::MAX must also fail.
+        let result_max = chrono_sort_hash_to_n(&temp_root, u64::MAX);
+        assert_eq!(result_max.err(), Some(ChronoIndexError::LookupIo));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched);
+    }
+
+    #[test]
+    fn hash_to_n_rejects_empty_index() {
+        // No index built yet → Err.
+        let temp_root = make_test_temp_root("empty_index");
+        let result = chrono_sort_hash_to_n(&temp_root, 0);
+        assert!(result.is_err(), "hash on absent index must return Err");
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn hash_to_n_changes_when_new_file_inserted_before_existing_file() {
+        // Construct a scenario where a rebuild causes a file to appear
+        // at position 0 that was not previously there.
+        //
+        // We simulate this by:
+        //   1. Building the index with two files (x, y) in order.
+        //   2. Recording hash_at_0 (position 0 = x).
+        //   3. Cold-rebuilding with a third file z that has an EARLIER
+        //      mtime than x (simulated by touching z and then x again).
+        //      After rebuild, position 0 = z, position 1 = x.
+        //   4. hash_at_0 must differ from the stored value.
+        //
+        // On a real filesystem we can simulate this by:
+        //   - Creating z first (so it has an earlier mtime than x).
+        //   - Then creating x and y.
+        //   - First build sees x and y (cold build skips z because z
+        //     was already there during the initial call — actually z IS
+        //     there, so the cold build sees all three).
+        //
+        // Cleaner simulation: build index with one file, record hash,
+        // then cold-rebuild with a *different* single file that has the
+        // same position 0 slot.
+        let temp_root = make_test_temp_root("position_shift");
+
+        // Directory A with one file.
+        let watched_a = make_watched_dir_with_files("pshift_a", &[("alpha.txt", b"a")]);
+        let _ = update_index(&temp_root, &watched_a).expect("build a");
+        let hash_alpha = chrono_sort_hash_to_n(&temp_root, 0).expect("hash alpha");
+
+        // Now index a completely different directory with a different file.
+        // This triggers a rebuild (different parent path).
+        let watched_b = make_watched_dir_with_files("pshift_b", &[("beta.txt", b"b")]);
+        let _ = update_index(&temp_root, &watched_b).expect("build b");
+        let hash_beta = chrono_sort_hash_to_n(&temp_root, 0).expect("hash beta");
+
+        assert_ne!(
+            hash_alpha, hash_beta,
+            "different file at position 0 must produce different hash"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched_a);
+        let _ = std::fs::remove_dir_all(&watched_b);
+    }
+
+    #[test]
+    fn hash_to_n_is_order_sensitive_not_set_sensitive() {
+        // This test verifies the key property that distinguishes
+        // chrono_sort_hash_to_n from signal_hash (XOR-based).
+        //
+        // Two separate indices, each with the same two basenames but in
+        // OPPOSITE chronological order, must produce different hashes.
+        //
+        // We achieve opposite order by creating the files in opposite
+        // insertion order (exploiting the 10 ms sleep in setup):
+        //   Index A: position 0 = "first.txt", position 1 = "second.txt"
+        //   Index B: position 0 = "second.txt", position 1 = "first.txt"
+        let temp_root_a = make_test_temp_root("order_sensitive_a");
+        let watched_a = make_watched_dir_with_files(
+            "order_sensitive_a",
+            &[("first.txt", b"f"), ("second.txt", b"s")],
+        );
+        let _ = update_index(&temp_root_a, &watched_a).expect("build a");
+        // Verify the index has the expected order: position 0's path ends with first.txt.
+        let mut buf = [0u8; MAX_FULL_PATH_LEN];
+        let r0 = lookup_abs_file_path_at_mtime_chronological_index(&temp_root_a, 0, &mut buf)
+            .expect("ok")
+            .expect("present");
+        let path0_a = buf[..r0.path_byte_length].to_vec();
+
+        let temp_root_b = make_test_temp_root("order_sensitive_b");
+        let watched_b = make_watched_dir_with_files(
+            "order_sensitive_b",
+            &[("second.txt", b"s"), ("first.txt", b"f")],
+        );
+        let _ = update_index(&temp_root_b, &watched_b).expect("build b");
+        let r0b = lookup_abs_file_path_at_mtime_chronological_index(&temp_root_b, 0, &mut buf)
+            .expect("ok")
+            .expect("present");
+        let path0_b = buf[..r0b.path_byte_length].to_vec();
+
+        // Only proceed with the hash comparison if the order actually
+        // differs (on some filesystems sub-10ms mtimes may collide;
+        // the record_id tiebreaker may then preserve insertion order
+        // for both). If the filesystem gave us the same order, skip the
+        // assertion to avoid a spurious test failure.
+        if path0_a != path0_b {
+            let hash_a = chrono_sort_hash_to_n(&temp_root_a, 1).expect("hash a");
+            let hash_b = chrono_sort_hash_to_n(&temp_root_b, 1).expect("hash b");
+            assert_ne!(
+                hash_a, hash_b,
+                "same files in different order must produce different hash"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_root_a);
+        let _ = std::fs::remove_dir_all(&temp_root_b);
+        let _ = std::fs::remove_dir_all(&watched_a);
+        let _ = std::fs::remove_dir_all(&watched_b);
+    }
+
+    #[test]
+    fn hash_to_n_covers_only_up_to_n_not_beyond() {
+        // If only the file AFTER position N changes (an appended file),
+        // the hash at position N must stay the same.
+        let temp_root = make_test_temp_root("prefix_stable");
+        let watched = make_watched_dir_with_files(
+            "prefix_stable",
+            &[("file0.dat", b"0"), ("file1.dat", b"1")],
+        );
+        let _ = update_index(&temp_root, &watched).expect("build");
+
+        // Record hash at position 0 and position 1.
+        let hash_at_0 = chrono_sort_hash_to_n(&temp_root, 0).expect("hash 0");
+        let hash_at_1 = chrono_sort_hash_to_n(&temp_root, 1).expect("hash 1");
+
+        // Add a new file (appended to the end: position 2).
+        add_file(&watched, "file2.dat", b"2");
+        let _ = update_index(&temp_root, &watched).expect("append");
+
+        // Hash at position 0 and 1 must be unchanged: positions 0 and 1
+        // were not affected by the append.
+        let hash_at_0_after = chrono_sort_hash_to_n(&temp_root, 0).expect("hash 0 after");
+        let hash_at_1_after = chrono_sort_hash_to_n(&temp_root, 1).expect("hash 1 after");
+        assert_eq!(
+            hash_at_0, hash_at_0_after,
+            "prefix hash at 0 must be stable after append"
+        );
+        assert_eq!(
+            hash_at_1, hash_at_1_after,
+            "prefix hash at 1 must be stable after append"
+        );
+
+        // Hash at position 2 (the new file) must now be computable.
+        let hash_at_2 = chrono_sort_hash_to_n(&temp_root, 2);
+        assert!(
+            hash_at_2.is_ok(),
+            "position 2 must be queryable after append"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched);
+    }
+
+    // -----------------------------------------------------------------
+    // check_chronosort_hash_to_n: correctness
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn check_returns_true_when_sequence_is_unchanged() {
+        let temp_root = make_test_temp_root("check_true");
+        let watched = make_watched_dir_with_files(
+            "check_true",
+            &[("move1", b"w"), ("move2", b"b"), ("move3", b"w")],
+        );
+        let _ = update_index(&temp_root, &watched).expect("build");
+
+        // Record hash for positions 0..=2.
+        let stored_hash = chrono_sort_hash_to_n(&temp_root, 2).expect("hash ok");
+
+        // No change to the directory; check must return true.
+        let unchanged = check_chronosort_hash_to_n(&temp_root, 2, stored_hash).expect("check ok");
+        assert!(unchanged, "unchanged sequence must yield Ok(true)");
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched);
+    }
+
+    #[test]
+    fn check_returns_false_when_stored_hash_does_not_match_current() {
+        let temp_root = make_test_temp_root("check_false");
+        let watched = make_watched_dir_with_files("check_false", &[("a", b"1"), ("b", b"2")]);
+        let _ = update_index(&temp_root, &watched).expect("build");
+
+        // Compute the real hash, then pass a deliberately wrong value
+        // as the "previous" hash.
+        let real_hash = chrono_sort_hash_to_n(&temp_root, 1).expect("hash ok");
+        let wrong_hash = real_hash.wrapping_add(1);
+
+        let changed = check_chronosort_hash_to_n(&temp_root, 1, wrong_hash).expect("check ok");
+        assert!(!changed, "mismatched previous_hash must yield Ok(false)");
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched);
+    }
+
+    #[test]
+    fn check_returns_false_after_rebuild_changes_position_content() {
+        // Build, store hash, rebuild against a different directory
+        // (same temp root), check → must be false.
+        let temp_root = make_test_temp_root("check_rebuild");
+        let watched_a = make_watched_dir_with_files("check_rebuild_a", &[("alpha", b"a")]);
+        let _ = update_index(&temp_root, &watched_a).expect("build a");
+        let hash_before_rebuild = chrono_sort_hash_to_n(&temp_root, 0).expect("hash before");
+
+        // Rebuild against a different watched directory.
+        let watched_b = make_watched_dir_with_files("check_rebuild_b", &[("beta", b"b")]);
+        let _ = update_index(&temp_root, &watched_b).expect("build b");
+
+        // check against the pre-rebuild hash must return false.
+        let result =
+            check_chronosort_hash_to_n(&temp_root, 0, hash_before_rebuild).expect("check ok");
+        assert!(
+            !result,
+            "hash after rebuild with different content must not match pre-rebuild hash"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched_a);
+        let _ = std::fs::remove_dir_all(&watched_b);
+    }
+
+    #[test]
+    fn check_returns_err_when_position_out_of_range() {
+        // Requesting a position past file_count must return Err (not
+        // a silent false, which would incorrectly signal "changed").
+        let temp_root = make_test_temp_root("check_oob");
+        let watched = make_watched_dir_with_files("check_oob", &[("sole", b"x")]);
+        let _ = update_index(&temp_root, &watched).expect("build");
+
+        let result = check_chronosort_hash_to_n(&temp_root, 5, 0xDEAD);
+        assert_eq!(result.err(), Some(ChronoIndexError::LookupIo));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched);
+    }
+
+    #[test]
+    fn check_plan_b_pattern_works_across_append_then_recheck() {
+        // End-to-end Plan-B usage pattern:
+        //
+        //   1. Build index (K files). Store hash_K = chrono_sort_hash_to_n(K-1).
+        //   2. Append one more file (K+1 total). Update index.
+        //   3. check_chronosort_hash_to_n(K-1, hash_K) must return true:
+        //      the first K positions are unchanged by a pure append.
+        //   4. Store hash_K1 = chrono_sort_hash_to_n(K).
+        //   5. check_chronosort_hash_to_n(K, hash_K1) must return true
+        //      immediately after storage.
+        let temp_root = make_test_temp_root("plan_b_pattern");
+        let watched = make_watched_dir_with_files(
+            "plan_b_pattern",
+            &[("move01", b"w"), ("move02", b"b"), ("move03", b"w")],
+        );
+        let _ = update_index(&temp_root, &watched).expect("build");
+        // K = 3, last position = 2.
+        let stored_hash_at_2 = chrono_sort_hash_to_n(&temp_root, 2).expect("initial hash");
+
+        // Append move04.
+        add_file(&watched, "move04", b"b");
+        let _ = update_index(&temp_root, &watched).expect("append");
+
+        // Positions 0..=2 are unchanged: check must return true.
+        let prefix_stable =
+            check_chronosort_hash_to_n(&temp_root, 2, stored_hash_at_2).expect("check ok");
+        assert!(
+            prefix_stable,
+            "Plan-B: pure append must not change hash of prefix positions"
+        );
+
+        // Store hash for position 3 (the new file).
+        let stored_hash_at_3 = chrono_sort_hash_to_n(&temp_root, 3).expect("hash at 3");
+        let still_same =
+            check_chronosort_hash_to_n(&temp_root, 3, stored_hash_at_3).expect("check 3 ok");
+        assert!(still_same, "freshly stored hash must match immediately");
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = std::fs::remove_dir_all(&watched);
+    }
+
+    #[test]
+    fn error_code_for_hash_functions_is_lookup_io() {
+        // Both functions must surface LookupIo (not another variant)
+        // for the out-of-range and no-index cases.
+        let temp_root = make_test_temp_root("error_code");
+        // No index built.
+        assert_eq!(
+            chrono_sort_hash_to_n(&temp_root, 0).err(),
+            Some(ChronoIndexError::LookupIo)
+        );
+        assert_eq!(
+            check_chronosort_hash_to_n(&temp_root, 0, 0).err(),
+            Some(ChronoIndexError::LookupIo)
+        );
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

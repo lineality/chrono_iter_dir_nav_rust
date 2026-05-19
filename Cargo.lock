@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "chrono_iter_dir_nav_module"
+name = "chrono_sort_search_dir_nav_module"
 version = "0.1.0"
