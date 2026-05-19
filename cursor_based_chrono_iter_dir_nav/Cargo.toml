@@ -1,0 +1,6 @@
+[package]
+name = "cursor_chrono_iter_dir_nav_module"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
